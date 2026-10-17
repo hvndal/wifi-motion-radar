@@ -117,6 +117,19 @@ Located in [`SimpleMotionView.tsx`](file:///c:/Users/herma/Documents/antigravity
   Accumulates $S_t = \max(0, S_{t-1} + (\text{variance} - \text{baseline}) - \text{leakRate})$.
   Triggers room occupancy confirmation only when persistence reaches $60\%$.
 
+### 4. Stationary Human Mapping (Respiratory Micro-Doppler + Static Residual)
+Located in [`predictiveModels.ts`](file:///c:/Users/herma/Documents/antigravity/lucid-babbage/web/src/utils/predictiveModels.ts):
+- Standard variance radars lose track of humans as soon as they sit still ($\sigma^2_{\text{RSSI}} \to 0$).
+- **Static Multipath Residual ($D_{\text{static}}$):** Compares live active OFDM subcarriers ($k \in [6..31, 33..58]$) against the calibrated empty-room profile $\mathbf{H}_{\text{empty}}$:
+  $$D_{\text{static}}(t) = \frac{1}{52}\sum_{k} \left| |H_k(t)| - |H_k^{\text{empty}}| \right|$$
+- **Respiratory Bandpass ($0.15\text{–}0.45\text{ Hz}$):** Applies a 2nd-order Butterworth bandpass filter (`10 Hz` sampling) across the Top-8 most sensitive subcarriers to isolate chest expansion (`10–26 BPM`), keeping **`PERSON X [STILL]`** locked on the radar.
+
+### 5. Multi-Signal Decomposition (`PERSON X / SIGNAL X`, `PERSON Y / SIGNAL Y`, & `PET`)
+Located in [`predictiveModels.ts`](file:///c:/Users/herma/Documents/antigravity/lucid-babbage/web/src/utils/predictiveModels.ts) and [`UavTacticalRadar.tsx`](file:///c:/Users/herma/Documents/antigravity/lucid-babbage/web/src/components/UavTacticalRadar.tsx):
+- Splits the 20 MHz 802.11n channel into **Lower Sub-Band (`SC 6..31`)** and **Upper Sub-Band (`SC 33..58`)** to track two independent spatial scatterers (`PERSON X` and `PERSON Y`).
+- **Front Desk vs. Back Router Disambiguation:** Default router placement is **`270° (BACK / SOUTH)`**. Direct corridor occlusion causes a negative RSSI drop ($\Delta\text{RSSI} < -1.1\text{ dB}$) along `270°`, whereas sitting at the desk in front of the ESP32 (`90° NORTH`) creates high CSI backscatter reflection with minimal RSSI drop.
+- **Pet / Low-Mass Filtering:** High-frequency CSI ripple with low total Radar Cross Section ($\text{RCS}$) and low RSSI shadow is tagged as **`PET (SIG X/Y)`** and excluded from the human headcount inside the user-selected radio radius (`3m`, `5m`, `8m`, `12m`).
+
 ---
 
 ## 5. Development & Running State
@@ -135,7 +148,7 @@ Located in [`SimpleMotionView.tsx`](file:///c:/Users/herma/Documents/antigravity
 python -c "import serial; s=serial.Serial('COM3', 115200, timeout=2); print(s.readline().decode()); s.close()"
 
 # 2. Verify API receives telemetry:
-curl http://localhost:3000/api/esp32
+curl.exe -s http://localhost:3000/api/esp32
 
 # 3. Check Git branch:
 git status
@@ -144,6 +157,7 @@ git status
 ---
 
 ## 6. Known Boundaries & Immediate Opportunities
-- **Hardware Bearing:** A single ESP32 receiver only measures scalar RSSI/CSI; it cannot physically deduce angle-of-arrival (AoA) without an antenna array. The compass orientation in the UAV Radar is calibrated by user directional toggle (North/East/South/West).
+- **Hardware Bearing:** A single ESP32 receiver only measures scalar RSSI/CSI; it cannot physically deduce continuous 360° angle-of-arrival (AoA) without an antenna array, though it disambiguates Front Backscatter (`90° N`) vs. Back Fresnel Occlusion (`270° S`).
 - **Multi-Node Expansion:** Adding a 2nd ESP32 creates a bistatic/trilateration mesh, enabling exact $(X, Y)$ cartesian coordinate triangulation of moving bodies.
 - **CSI Phase Extraction:** ESP-IDF supports raw I/Q phase vectors. Future upgrades can enable Doppler spectrum filtering using FFT on raw subcarriers.
+

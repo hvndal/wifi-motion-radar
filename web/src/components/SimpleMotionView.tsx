@@ -2,7 +2,6 @@
 
 import React, { useState, useEffect } from "react";
 import {
-  ShieldCheck,
   AlertTriangle,
   Radio,
   Sliders,
@@ -19,7 +18,9 @@ import {
   ShieldAlert,
   Gauge,
   Activity,
+  Crosshair,
 } from "lucide-react";
+import { TrackedSignalEntity } from "@/utils/predictiveModels";
 
 interface SimpleMotionViewProps {
   connected: boolean;
@@ -43,6 +44,15 @@ interface SimpleMotionViewProps {
   leakyBucketLevel: number;
   occupancyLimit: 1 | 2;
   onSetOccupancyLimit: (limit: 1 | 2) => void;
+  // New Multi-Target & Radius Selection Props
+  trackedEntities?: TrackedSignalEntity[];
+  selectedRadiusMeters?: number;
+  onSelectRadiusMeters?: (r: number) => void;
+  estimatedPeopleInRadius?: number;
+  estimatedPetsInRadius?: number;
+  respirationBpm?: number;
+  stationaryPresenceScore?: number;
+  predictionStatusText?: string;
 }
 
 export function SimpleMotionView({
@@ -65,6 +75,14 @@ export function SimpleMotionView({
   leakyBucketLevel,
   occupancyLimit,
   onSetOccupancyLimit,
+  trackedEntities = [],
+  selectedRadiusMeters = 6.0,
+  onSelectRadiusMeters,
+  estimatedPeopleInRadius = 0,
+  estimatedPetsInRadius = 0,
+  respirationBpm = 16.0,
+  stationaryPresenceScore = 0,
+  predictionStatusText = "Monitoring 2.4 GHz multipath field...",
 }: SimpleMotionViewProps) {
   // Activity timeline in plain English
   const [history, setHistory] = useState<
@@ -72,24 +90,34 @@ export function SimpleMotionView({
   >([]);
 
   useEffect(() => {
-    const nowStr = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    const nowStr = new Date().toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
     if (isMoving) {
       setHistory((prev) => [
         {
           id: `m-${Date.now()}`,
           time: nowStr,
-          text: "Movement detected in the room",
+          text:
+            trackedEntities.length > 0
+              ? `${trackedEntities[0].designation} detected at ${trackedEntities[0].rangeMeters}m`
+              : "Movement detected in the room",
           type: "motion",
         },
         ...prev.slice(0, 15),
       ]);
     }
-  }, [isMoving]);
+  }, [isMoving, trackedEntities]);
 
   // Compute friendly activity level percentage (0 to 100%)
   const activityScore = connected
-    ? Math.min(100, Math.round((variance * 28) + (decorrelationSpread * 8)))
+    ? Math.min(100, Math.round(variance * 28 + decorrelationSpread * 8))
     : 0;
+
+  const isStationaryOccupied =
+    !isMoving && (estimatedPeopleInRadius > 0 || stationaryPresenceScore >= 32);
 
   return (
     <div className="flex flex-col gap-5 w-full max-w-4xl mx-auto">
@@ -113,31 +141,37 @@ export function SimpleMotionView({
           </div>
         </div>
       ) : (
-        <div className="px-4 py-2.5 rounded-xl bg-emerald-950/40 border border-emerald-500/30 flex items-center justify-between text-xs font-mono text-emerald-300">
+        <div className="px-4 py-2.5 rounded-xl bg-emerald-950/40 border border-emerald-500/30 flex flex-wrap items-center justify-between gap-2 text-xs font-mono text-emerald-300">
           <div className="flex items-center gap-2">
             <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping" />
             <span>
-              <strong>ESP32 Sensor Active & Connected:</strong> {ip}
+              <strong>ESP32 Sensor Active &amp; Connected:</strong> {ip}
             </span>
           </div>
           <span className="text-[11px] text-emerald-400/80">
-            Wi-Fi Signal: {rssi} dBm (Healthy)
+            Router in Back (270°) &bull; Signal: {rssi} dBm
           </span>
         </div>
       )}
 
-      {/* 2. THE BIG HUMAN PRESENCE CARD (Main attraction for non-tech users) */}
+      {/* 2. THE BIG HUMAN PRESENCE CARD (Supports Moving, Stationary Breathing, and Empty) */}
       <div
         className={`relative overflow-hidden p-6 md:p-10 rounded-3xl border-2 transition-all duration-300 shadow-2xl ${
           isMoving
             ? "bg-gradient-to-b from-rose-950/60 to-slate-950 border-rose-500 shadow-rose-950/50"
+            : isStationaryOccupied
+            ? "bg-gradient-to-b from-cyan-950/50 to-slate-950 border-cyan-500/60 shadow-cyan-950/30"
             : "bg-gradient-to-b from-emerald-950/40 to-slate-950 border-emerald-500/40 shadow-emerald-950/20"
         }`}
       >
         {/* Ambient background glow ring */}
         <div
           className={`absolute -top-24 -right-24 w-72 h-72 rounded-full blur-3xl pointer-events-none transition-all duration-500 ${
-            isMoving ? "bg-rose-500/20" : "bg-emerald-500/10"
+            isMoving
+              ? "bg-rose-500/20"
+              : isStationaryOccupied
+              ? "bg-cyan-500/15"
+              : "bg-emerald-500/10"
           }`}
         />
 
@@ -148,10 +182,12 @@ export function SimpleMotionView({
               className={`w-20 h-20 md:w-24 md:h-24 rounded-2xl flex items-center justify-center shrink-0 border transition-all duration-300 ${
                 isMoving
                   ? "bg-rose-500/20 border-rose-500/60 text-rose-300 shadow-[0_0_30px_rgba(244,63,94,0.4)] animate-bounce"
+                  : isStationaryOccupied
+                  ? "bg-cyan-500/20 border-cyan-500/50 text-cyan-300 shadow-[0_0_25px_rgba(6,182,212,0.3)]"
                   : "bg-emerald-500/10 border-emerald-500/30 text-emerald-300"
               }`}
             >
-              {isMoving ? (
+              {isMoving || isStationaryOccupied ? (
                 <UserCheck className="w-12 h-12" />
               ) : (
                 <UserX className="w-12 h-12" />
@@ -159,33 +195,45 @@ export function SimpleMotionView({
             </div>
 
             <div>
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <span
                   className={`px-2.5 py-0.5 rounded-full text-[11px] font-bold uppercase tracking-wider ${
                     isMoving
                       ? "bg-rose-500/20 text-rose-300 border border-rose-500/50 animate-pulse"
+                      : isStationaryOccupied
+                      ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/50"
                       : "bg-emerald-500/20 text-emerald-300 border border-emerald-500/50"
                   }`}
                 >
-                  {isMoving ? "Live Alert" : "Live Status"}
+                  {isMoving
+                    ? "Active Motion Alert"
+                    : isStationaryOccupied
+                    ? `Stationary Presence (${respirationBpm} BPM)`
+                    : "Empty / Clear"}
                 </span>
                 <span className="text-xs text-slate-400 font-mono">
-                  Recorded Triggers: <strong>{triggerCount}</strong>
+                  Triggers: <strong>{triggerCount}</strong>
                 </span>
               </div>
 
               <h2
                 className={`text-2xl md:text-4xl font-extrabold tracking-tight mt-1 transition-colors duration-200 ${
-                  isMoving ? "text-rose-200" : "text-emerald-200"
+                  isMoving
+                    ? "text-rose-200"
+                    : isStationaryOccupied
+                    ? "text-cyan-200"
+                    : "text-emerald-200"
                 }`}
               >
-                {isMoving ? "MOVEMENT DETECTED!" : "ROOM IS QUIET & STILL"}
+                {isMoving
+                  ? "MOVEMENT DETECTED!"
+                  : isStationaryOccupied
+                  ? "STATIONARY PERSON MAPPED"
+                  : "ROOM IS QUIET & EMPTY"}
               </h2>
 
               <p className="text-sm text-slate-300 mt-1 max-w-md">
-                {isMoving
-                  ? "Someone is walking or moving in the room! The Wi-Fi wave disturbance has tripped the sensor."
-                  : "No movement detected in the room right now. The space is calm and static."}
+                {predictionStatusText}
               </p>
             </div>
           </div>
@@ -207,9 +255,9 @@ export function SimpleMotionView({
         {/* Live Activity Meter Bar */}
         <div className="mt-8 pt-6 border-t border-slate-800/80">
           <div className="flex items-center justify-between text-xs font-mono text-slate-400 mb-2">
-            <span>Room Motion Intensity</span>
-            <span className={isMoving ? "text-rose-400 font-bold" : "text-emerald-400"}>
-              {activityScore}% ({isMoving ? "Active" : "Quiet"})
+            <span>Room RF Perturbation &amp; Stationary Presence</span>
+            <span className={isMoving ? "text-rose-400 font-bold" : "text-cyan-300"}>
+              Motion: {activityScore}% | Stationary Lock: {stationaryPresenceScore}%
             </span>
           </div>
           <div className="w-full bg-slate-900 rounded-full h-3 overflow-hidden border border-slate-800">
@@ -217,15 +265,19 @@ export function SimpleMotionView({
               className={`h-full transition-all duration-200 rounded-full ${
                 isMoving
                   ? "bg-gradient-to-r from-amber-500 via-rose-500 to-red-500 shadow-[0_0_15px_rgba(244,63,94,0.5)]"
+                  : isStationaryOccupied
+                  ? "bg-gradient-to-r from-cyan-500 to-emerald-400"
                   : "bg-emerald-500/70"
               }`}
-              style={{ width: `${Math.max(4, Math.min(100, activityScore))}%` }}
+              style={{
+                width: `${Math.max(4, Math.min(100, Math.max(activityScore, stationaryPresenceScore)))}%`,
+              }}
             />
           </div>
         </div>
       </div>
 
-      {/* 2.5 LIVE OCCUPANCY & MULTI-PERSON GUARD CARD */}
+      {/* 2.5 LIVE OCCUPANCY, RADIUS SELECTION & SIGNAL X / SIGNAL Y TRACKER */}
       <div className="p-6 rounded-3xl bg-slate-900/80 border border-slate-800 shadow-xl space-y-5">
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800/80 pb-4">
           <div className="flex items-center gap-3">
@@ -235,74 +287,103 @@ export function SimpleMotionView({
             <div>
               <div className="flex items-center gap-2">
                 <h3 className="text-base font-bold text-slate-100 font-mono uppercase tracking-wide">
-                  Live Occupancy Sentinel
+                  Radius Occupancy &amp; Signal X / Y Pinpointer
                 </h3>
                 <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/40">
-                  REAL-TIME RF GUARD
+                  BREATHING + MOTION FUSION
                 </span>
               </div>
               <p className="text-xs text-slate-400">
-                Detects multiple simultaneous bodies via subcarrier phase decorrelation &bull; Zero cameras
+                Maps moving &amp; stationary humans (Person X, Person Y) and separates low-mass pets inside your selected radio radius
               </p>
             </div>
           </div>
 
-          {/* Occupancy Limit Selector */}
-          <div className="flex items-center gap-2 bg-slate-950 p-1.5 rounded-xl border border-slate-800">
-            <span className="text-[11px] font-mono text-slate-400 pl-2">Room Limit:</span>
-            <button
-              onClick={() => onSetOccupancyLimit(1)}
-              className={`px-3 py-1 rounded-lg text-xs font-mono font-bold transition-all cursor-pointer ${
-                occupancyLimit === 1
-                  ? "bg-cyan-500 text-slate-950 shadow-sm"
-                  : "text-slate-400 hover:text-slate-200"
-              }`}
-            >
-              1 Person Max
-            </button>
-            <button
-              onClick={() => onSetOccupancyLimit(2)}
-              className={`px-3 py-1 rounded-lg text-xs font-mono font-bold transition-all cursor-pointer ${
-                occupancyLimit === 2
-                  ? "bg-purple-600 text-white shadow-sm"
-                  : "text-slate-400 hover:text-slate-200"
-              }`}
-            >
-              2 People Max
-            </button>
+          {/* Radio Scan Radius Selector */}
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="flex items-center gap-1 bg-slate-950 p-1.5 rounded-xl border border-slate-800">
+              <span className="text-[11px] font-mono text-cyan-400 pl-2 pr-1 font-bold">
+                Radio Radius:
+              </span>
+              {[3, 5, 8, 12].map((r) => (
+                <button
+                  key={r}
+                  onClick={() => onSelectRadiusMeters && onSelectRadiusMeters(r)}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-mono font-bold transition-all cursor-pointer ${
+                    selectedRadiusMeters === r
+                      ? "bg-cyan-500 text-slate-950 shadow-sm"
+                      : "text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  {r}m
+                </button>
+              ))}
+            </div>
+
+            {/* Occupancy Limit Selector */}
+            <div className="flex items-center gap-1.5 bg-slate-950 p-1.5 rounded-xl border border-slate-800">
+              <span className="text-[11px] font-mono text-slate-400 pl-2">Max:</span>
+              <button
+                onClick={() => onSetOccupancyLimit(1)}
+                className={`px-2.5 py-1 rounded-lg text-xs font-mono font-bold transition-all cursor-pointer ${
+                  occupancyLimit === 1
+                    ? "bg-cyan-500 text-slate-950 shadow-sm"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                1 Person
+              </button>
+              <button
+                onClick={() => onSetOccupancyLimit(2)}
+                className={`px-2.5 py-1 rounded-lg text-xs font-mono font-bold transition-all cursor-pointer ${
+                  occupancyLimit === 2
+                    ? "bg-purple-600 text-white shadow-sm"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+              >
+                2 People
+              </button>
+            </div>
           </div>
         </div>
 
         {/* Live Classification Grid */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-          {/* Card 1: Estimated Occupants */}
+          {/* Card 1: Estimated Occupants in Selected Radius */}
           <div className="p-4 rounded-2xl bg-slate-950 border border-slate-800 flex flex-col justify-between">
             <span className="text-[11px] font-mono text-slate-400 uppercase tracking-wider">
-              Estimated Occupancy
+              People in {selectedRadiusMeters}m Radius
             </span>
-            <div className="my-2">
+            <div className="my-2 flex items-baseline gap-2">
               <span
                 className={`text-2xl font-black font-mono ${
-                  occupancyState === "MULTI"
+                  estimatedPeopleInRadius >= 2 || occupancyState === "MULTI"
                     ? "text-rose-400"
-                    : occupancyState === "SINGLE"
+                    : estimatedPeopleInRadius === 1 || occupancyState === "SINGLE"
                     ? "text-cyan-300"
                     : "text-emerald-400"
                 }`}
               >
-                {occupancyState === "MULTI"
+                {estimatedPeopleInRadius >= 2 || occupancyState === "MULTI"
                   ? "2+ PEOPLE"
-                  : occupancyState === "SINGLE"
+                  : estimatedPeopleInRadius === 1 || occupancyState === "SINGLE"
                   ? "1 PERSON"
                   : "0 (EMPTY)"}
               </span>
+              {estimatedPetsInRadius > 0 && (
+                <span className="text-xs font-mono font-bold text-amber-400">
+                  (+{estimatedPetsInRadius} Pet/Small)
+                </span>
+              )}
             </div>
             <div className="text-[11px] font-mono text-slate-400">
-              {occupancyState === "MULTI"
-                ? "Simultaneous multi-body scatter"
-                : occupancyState === "SINGLE"
-                ? "Single coherent walking scatter"
-                : "Zero microwave disturbance"}
+              {estimatedPeopleInRadius >= 2
+                ? "Person X + Person Y simultaneous scatter"
+                : estimatedPeopleInRadius === 1
+                ? isMoving
+                  ? "Person X (Signal X) moving in radius"
+                  : `Person X stationary (${respirationBpm} BPM lock)`
+                : "Zero human signatures inside radius"}
             </div>
           </div>
 
@@ -314,12 +395,16 @@ export function SimpleMotionView({
             <div className="my-2">
               <span
                 className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-mono font-bold ${
-                  (occupancyLimit === 1 && occupancyState === "MULTI") || leakyBucketLevel >= 60
+                  (occupancyLimit === 1 &&
+                    (occupancyState === "MULTI" || estimatedPeopleInRadius >= 2)) ||
+                  leakyBucketLevel >= 60
                     ? "bg-rose-500/20 text-rose-300 border border-rose-500/50 animate-pulse"
                     : "bg-emerald-500/20 text-emerald-300 border border-emerald-500/50"
                 }`}
               >
-                {(occupancyLimit === 1 && occupancyState === "MULTI") || leakyBucketLevel >= 60 ? (
+                {(occupancyLimit === 1 &&
+                  (occupancyState === "MULTI" || estimatedPeopleInRadius >= 2)) ||
+                leakyBucketLevel >= 60 ? (
                   <>
                     <ShieldAlert className="w-3.5 h-3.5 text-rose-400" />
                     <span>LIMIT EXCEEDED</span>
@@ -333,9 +418,11 @@ export function SimpleMotionView({
               </span>
             </div>
             <div className="text-[11px] font-mono text-slate-400">
-              {(occupancyLimit === 1 && occupancyState === "MULTI") || leakyBucketLevel >= 60
-                ? "Sustained crowd signature detected"
-                : `Allowed: Up to ${occupancyLimit} guest${occupancyLimit > 1 ? "s" : ""}`}
+              {(occupancyLimit === 1 &&
+                (occupancyState === "MULTI" || estimatedPeopleInRadius >= 2)) ||
+              leakyBucketLevel >= 60
+                ? "Multiple human signals detected"
+                : `Allowed: Up to ${occupancyLimit} person${occupancyLimit > 1 ? "s" : ""}`}
             </div>
           </div>
 
@@ -350,22 +437,91 @@ export function SimpleMotionView({
             </div>
             <div className="text-[11px] font-mono text-slate-400">
               {decorrelationSpread >= 2.5
-                ? "High decorrelation (Multiple bodies >= 2.5)"
+                ? "High decorrelation (Person X + Person Y)"
                 : decorrelationSpread >= 0.8
-                ? "Coherent scatter (Single reflector 0.8-2.5)"
+                ? "Coherent scatter (Single Person X)"
                 : "Quiet baseline (< 0.8)"}
             </div>
           </div>
         </div>
 
+        {/* Active Decomposed Pointers List: PERSON X (SIGNAL X) & PERSON Y (SIGNAL Y) */}
+        <div className="p-4 rounded-2xl bg-slate-950/90 border border-slate-800 space-y-2.5 font-mono">
+          <div className="flex items-center justify-between text-xs">
+            <span className="text-cyan-300 font-bold flex items-center gap-1.5">
+              <Crosshair className="w-3.5 h-3.5 text-cyan-400" />
+              LIVE SIGNAL POINTERS IN {selectedRadiusMeters}m RADIUS (PERSON X &amp; PERSON Y)
+            </span>
+            <span className="text-[10px] text-slate-400">
+              {trackedEntities.length} Active Signal{trackedEntities.length === 1 ? "" : "s"}
+            </span>
+          </div>
+
+          {trackedEntities.length === 0 ? (
+            <div className="text-xs text-slate-500 py-3 text-center border border-dashed border-slate-800 rounded-xl">
+              No active signals inside {selectedRadiusMeters}m radius. Walk or sit near the laptop to lock Person X.
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              {trackedEntities.map((ent) => (
+                <div
+                  key={ent.id}
+                  className="p-3 rounded-xl bg-slate-900/90 border border-slate-800 flex items-center justify-between"
+                >
+                  <div className="space-y-0.5">
+                    <div className="flex items-center gap-2">
+                      <span
+                        className={`w-2.5 h-2.5 rounded-full ${
+                          ent.classification === "PET_OR_LOW_MASS"
+                            ? "bg-amber-400"
+                            : ent.id === "signal-y"
+                            ? "bg-purple-400"
+                            : ent.classification === "HUMAN_STATIONARY"
+                            ? "bg-emerald-400"
+                            : "bg-rose-500 animate-ping"
+                        }`}
+                      />
+                      <span className="text-xs font-bold text-slate-100">
+                        {ent.designation}
+                      </span>
+                    </div>
+                    <div className="text-[10px] text-slate-400">
+                      {ent.sector === "DESK_REFLECTION_NORTH"
+                        ? "Sector: Front Desk (90° Backscatter)"
+                        : ent.sector === "FRESNEL_CORE_SOUTH"
+                        ? "Sector: Back Router Corridor (270°)"
+                        : "Sector: Secondary Multipath Lobe"}
+                    </div>
+                    <div className="text-[10px] text-cyan-400">
+                      {ent.classification === "HUMAN_STATIONARY"
+                        ? `Stationary Breathing Lock: ~${ent.breathingBpm ?? 16} BPM`
+                        : ent.classification === "PET_OR_LOW_MASS"
+                        ? "Low-Mass Scatter (Possible Pet / Small Object)"
+                        : `Radial Velocity: ${ent.velocityMs} m/s`}
+                    </div>
+                  </div>
+                  <div className="text-right">
+                    <div className="text-base font-black text-cyan-300">
+                      {ent.rangeMeters}m
+                    </div>
+                    <div className="text-[10px] text-slate-400">
+                      {Math.round(ent.confidence * 100)}% conf
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
         {/* The Two Live Mathematical Meters */}
-        <div className="space-y-4 pt-2">
+        <div className="space-y-4 pt-1">
           {/* Meter 1: Instantaneous Multi-Body Probability */}
           <div>
             <div className="flex items-center justify-between text-xs font-mono text-slate-400 mb-1.5">
               <span className="flex items-center gap-1.5 text-slate-300 font-bold">
                 <Gauge className="w-3.5 h-3.5 text-cyan-400" />
-                Multi-Body Scatter Probability (Instantaneous)
+                Multi-Body Scatter Probability (Signal X + Signal Y)
               </span>
               <span className={multiPersonProb >= 50 ? "text-rose-400 font-bold" : "text-cyan-300"}>
                 {multiPersonProb}% ({multiPersonProb >= 50 ? "Multi-Body" : "Single / Quiet"})
@@ -388,14 +544,13 @@ export function SimpleMotionView({
             <div className="flex items-center justify-between text-xs font-mono">
               <span className="text-purple-300 font-bold flex items-center gap-1.5">
                 <Activity className="w-3.5 h-3.5 text-purple-400" />
-                Sustained Multi-Person Persistence (Leaky Bucket Integrator)
+                Sustained Multi-Person Persistence (Leaky Bucket CUSUM)
               </span>
-              <span className={leakyBucketLevel > 50 ? "text-rose-400 font-bold" : "text-slate-300"}>
+              <span className={leakyBucketLevel >= 60 ? "text-rose-400 font-bold" : "text-slate-300"}>
                 {Math.round(leakyBucketLevel)}% / 100%
               </span>
             </div>
             <div className="w-full bg-slate-900 rounded-full h-3 overflow-hidden border border-slate-800 relative">
-              {/* Alert trigger line at 60% */}
               <div
                 className="absolute top-0 bottom-0 w-0.5 bg-rose-500 z-10"
                 style={{ left: "60%" }}
@@ -403,16 +558,13 @@ export function SimpleMotionView({
               />
               <div
                 className={`h-full transition-all duration-300 rounded-full ${
-                  leakyBucketLevel > 60
+                  leakyBucketLevel >= 60
                     ? "bg-gradient-to-r from-amber-500 via-rose-500 to-red-500"
                     : "bg-gradient-to-r from-cyan-500 to-purple-500"
                 }`}
                 style={{ width: `${Math.max(2, leakyBucketLevel)}%` }}
               />
             </div>
-            <p className="text-[11px] text-slate-400 font-sans leading-relaxed">
-              <strong>How this prevents false alarms:</strong> When a single person paces or unpacks luggage, the bucket drains back to 0% as soon as they pause. The bucket only accumulates past the red line when multiple people move continuously at the same time.
-            </p>
           </div>
         </div>
       </div>
@@ -424,13 +576,13 @@ export function SimpleMotionView({
           <div>
             <div className="flex items-center gap-2 text-cyan-400 text-xs font-bold uppercase tracking-wider mb-1">
               <Sliders className="w-4 h-4" />
-              <span>Room Calibration</span>
+              <span>Empty-Room Reference Calibration</span>
             </div>
             <h3 className="text-base font-bold text-slate-100">
-              Calibrate to Your Room
+              Lock Empty-Room Profile
             </h3>
             <p className="text-xs text-slate-400 mt-1 leading-relaxed">
-              Every room has a slightly different shape and furniture. Click this while sitting still for 3 seconds so the sensor learns your room&apos;s quiet baseline.
+              Snapshots the 64-subcarrier multipath profile of your room so the radar can keep stationary people mapped via static shadowing &amp; breathing micro-Doppler.
             </p>
           </div>
 
@@ -446,12 +598,12 @@ export function SimpleMotionView({
             {isCalibrating ? (
               <>
                 <RefreshCw className="w-4 h-4 animate-spin text-cyan-300" />
-                <span>Calibrating... Stay Still ({calibrationProgress}%)</span>
+                <span>Calibrating... ({calibrationProgress}%)</span>
               </>
             ) : (
               <>
                 <Sparkles className="w-4 h-4" />
-                <span>Calibrate Room (3 Seconds)</span>
+                <span>Calibrate Room Baseline (3s)</span>
               </>
             )}
           </button>
@@ -468,7 +620,7 @@ export function SimpleMotionView({
               Detection Sensitivity
             </h3>
             <p className="text-xs text-slate-400 mt-1 leading-relaxed">
-              Choose how sensitive the Wi-Fi radar should be to movement.
+              Choose how sensitive the Wi-Fi radar should be to subtle movements and breathing.
             </p>
           </div>
 
@@ -477,7 +629,7 @@ export function SimpleMotionView({
               [
                 { id: "low", label: "Low", desc: "Walking only" },
                 { id: "normal", label: "Normal", desc: "Recommended" },
-                { id: "high", label: "High", desc: "Small gestures" },
+                { id: "high", label: "High", desc: "Micro-motion" },
               ] as const
             ).map((lvl) => (
               <button
@@ -497,17 +649,17 @@ export function SimpleMotionView({
         </div>
       </div>
 
-      {/* 4. Plain English "How Does It Work?" Explainer */}
+      {/* 4. Plain English Explainer */}
       <div className="p-5 rounded-2xl bg-gradient-to-r from-slate-900 to-slate-950 border border-slate-800 text-xs text-slate-300 flex items-start gap-4">
         <div className="w-9 h-9 rounded-xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center text-cyan-400 shrink-0 mt-0.5">
           <Info className="w-5 h-5" />
         </div>
         <div>
           <h4 className="text-sm font-bold text-slate-100 mb-1">
-            How does this work without any cameras or microphones?
+            How Person X, Person Y, Stationary Breathing, and Pets are Separated
           </h4>
           <p className="leading-relaxed text-slate-400">
-            Your home Wi-Fi router fills this room with invisible radio waves. Because the human body is ~70% water, walking through the room reflects and absorbs these waves like casting a shadow. The ESP32 microchip measures those tiny wave ripples 10 times a second and spots human movement instantly—with <strong className="text-cyan-300">100% privacy and zero cameras</strong>.
+            We split the 20 MHz Wi-Fi channel into Lower (<code className="text-cyan-300">SC 6..31</code>) and Upper (<code className="text-purple-300">SC 33..58</code>) sub-bands. A single human body (<strong className="text-cyan-300">Person X</strong>) casts a deep radio shadow and exhibits a <strong className="text-emerald-300">0.15–0.45 Hz chest breathing rhythm</strong> when sitting still. A second person (<strong className="text-purple-300">Person Y</strong>) creates frequency-selective interference notches across both sub-bands, while pets produce fast micro-Doppler ripples with minimal RSSI shadowing.
           </p>
         </div>
       </div>
@@ -517,7 +669,7 @@ export function SimpleMotionView({
         <div className="p-5 rounded-2xl bg-slate-900/50 border border-slate-800">
           <div className="flex items-center gap-2 text-xs font-mono text-slate-400 mb-3">
             <Clock className="w-4 h-4 text-cyan-400" />
-            <span>Recent Activity Log</span>
+            <span>Recent Signal Activity Log</span>
           </div>
           <div className="space-y-2 max-h-48 overflow-y-auto">
             {history.map((item) => (

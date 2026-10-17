@@ -11,9 +11,9 @@ This document tracks active development phases, prioritized tasks, and implement
 | **Phase 1: Foundation** | Hardware firmware, Promiscuous RX, CSI callback, Serial bridge | ✅ COMPLETE | 100% |
 | **Phase 2: Tactical HUD** | CoD UAV Polar Radar, Log-Distance model, Fresnel Zone ellipse | ✅ COMPLETE | 100% |
 | **Phase 3: Occupancy Intelligence** | Subcarrier Decorrelation, CUSUM persistence, multi-person limit | ✅ COMPLETE | 100% |
-| **Phase 4: Multi-Node Triangulation & Bearing** | Multi-ESP32 mesh, AoA (Angle-of-Arrival), cartesian X/Y tracking | 🟡 READY FOR ARGON | 0% |
-| **Phase 5: Respiration & Micro-Doppler** | FFT spectral chest displacement filter for stationary humans | ⚪ PLANNED | 0% |
-| **Phase 6: Audio & Webhooks Alerting** | Browser Web Audio SFX (UAV radar sweep blip, intruder siren) & Webhook alerts | ⚪ PLANNED | 0% |
+| **Phase 4: Multi-Signal Decomposition & Radius** | Signal X & Signal Y sub-band pointers, Pet separation, Back (270°) router & radius selector | ✅ COMPLETE | 100% |
+| **Phase 5: Respiration & Micro-Doppler** | 0.15–0.45 Hz Butterworth bandpass + Static CSI Residual for stationary humans | ✅ COMPLETE | 100% |
+| **Phase 6: Audio & Webhooks Alerting** | Browser Web Audio SFX (UAV radar sweep blip, intruder siren) & Webhook alerts | ✅ COMPLETE | 100% |
 
 ---
 

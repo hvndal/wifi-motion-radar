@@ -29,6 +29,10 @@ import CsiSpectrogramCanvas from "@/components/CsiSpectrogramCanvas";
 import { UavTacticalRadar } from "@/components/UavTacticalRadar";
 import { PhoneQrCodeModal } from "@/components/PhoneQrCodeModal";
 import { SimpleMotionView } from "@/components/SimpleMotionView";
+import {
+  MultiTargetRfTracker,
+  RfDecompositionResult,
+} from "@/utils/predictiveModels";
 
 interface MotionEvent {
   id: string;
@@ -84,15 +88,34 @@ export default function WifiMotionLab() {
   const [activeRightTab, setActiveRightTab] = useState<"fusion" | "occupancy" | "events" | "terminal">("fusion");
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
 
-  // Live Occupancy Sentinel & Anti-Party Guard State
+  // Live Occupancy Sentinel, Radio Scan Radius & Multi-Target RF Decomposition State
   const [occupancyLimit, setOccupancyLimit] = useState<1 | 2>(1);
   const [leakyBucketLevel, setLeakyBucketLevel] = useState<number>(0);
+  const [selectedRadiusMeters, setSelectedRadiusMeters] = useState<number>(8);
+  const [routerBearingDeg] = useState<number>(270); // Default 270° (BACK / SOUTH) per user room layout
+  const [rfDecomp, setRfDecomp] = useState<RfDecompositionResult>({
+    entities: [],
+    estimatedPeopleInRadius: 0,
+    estimatedPetsInRadius: 0,
+    totalSignalsInRadius: 0,
+    stationaryPresenceScore: 0,
+    respirationDetected: false,
+    respirationBpm: 15.2,
+    respirationConfidence: 0,
+    staticMultipathResidual: 0,
+    lowerBandVariance: 0,
+    upperBandVariance: 0,
+    predictedNextRssi: -60.0,
+    predictedNextVariance: 0.12,
+    predictionStatusText: "Initializing 2.4 GHz multipath decomposition...",
+  });
+  const rfTrackerRef = useRef<MultiTargetRfTracker>(new MultiTargetRfTracker());
 
   // Logs & References
   const [events, setEvents] = useState<MotionEvent[]>([]);
   const [terminalLogs, setTerminalLogs] = useState<string[]>([
     "[SYSTEM] Zero-Cost Wi-Fi Motion Sensing Lab Active",
-    "[NETWORK] Target Wi-Fi AP: Channel 8 (2.4 GHz Multipath Corridor)",
+    "[NETWORK] Target Wi-Fi AP: Channel 8 (2.4 GHz Multipath Corridor • BACK 270°)",
     "[HARDWARE] ESP32 Promiscuous & 64-OFDM CSI Sniffer Ready",
     "[AUTO-SYNC] Polling ESP32 telemetry @ 10 Hz...",
   ]);
@@ -411,6 +434,8 @@ export default function WifiMotionLab() {
 
         setBaselineVariance(newBaseline);
         setTriggerThreshold(newThreshold);
+        // Calibrate Empty-Room 64-Subcarrier Multipath Profile for Stationary Human Mapping
+        rfTrackerRef.current.calibrateEmptyRoom(subcarrierAmplitudes, slowRssi || wifiRssi);
         playChime(1046);
 
         setEvents((prev) => [
@@ -418,7 +443,7 @@ export default function WifiMotionLab() {
             id: `cal-${Date.now()}`,
             timestamp: new Date().toLocaleTimeString(),
             type: "baseline_calibrated",
-            message: `Baseline Calibrated: ${newBaseline} dB² | Dynamic Threshold: ${newThreshold} dB²`,
+            message: `Empty-Room CSI & Baseline Calibrated: ${newBaseline} dB² | Threshold: ${newThreshold} dB²`,
             wifiVariance: newBaseline,
             csiVariance,
           },
@@ -465,21 +490,67 @@ export default function WifiMotionLab() {
     return parseFloat(varDiff.toFixed(2));
   }, [hwDecorrelation, subcarrierAmplitudes]);
 
+  // Log-Distance Path Loss distance to router: d = 10^((|RSSI| - 42) / (10 * 2.4))
+  const routerDistMeters = useMemo(() => {
+    const refRssi = slowRssi < -10 ? slowRssi : wifiRssi;
+    const rawDist = Math.pow(10, (Math.abs(refRssi) - 42) / (10 * 2.4));
+    return Number(Math.max(1.0, Math.min(12.0, rawDist)).toFixed(2));
+  }, [slowRssi, wifiRssi]);
+
+  // Multi-Target RF Decomposition & Stationary Human Respiration Lock (10 Hz)
+  useEffect(() => {
+    const trackerTimer = setInterval(() => {
+      const result = rfTrackerRef.current.step({
+        rssi: wifiRssi,
+        slowRssi: slowRssi || wifiRssi,
+        wifiVariance,
+        csiVariance,
+        decorrelationSpread,
+        subcarriers: subcarrierAmplitudes,
+        triggerThreshold,
+        routerDistMeters,
+        routerBearingDeg,
+        selectedRadiusMeters,
+        connected: autoSyncConnected || isSerialConnected,
+      });
+      setRfDecomp(result);
+    }, 100);
+
+    return () => clearInterval(trackerTimer);
+  }, [
+    wifiRssi,
+    slowRssi,
+    wifiVariance,
+    csiVariance,
+    decorrelationSpread,
+    subcarrierAmplitudes,
+    triggerThreshold,
+    routerDistMeters,
+    routerBearingDeg,
+    selectedRadiusMeters,
+    autoSyncConnected,
+    isSerialConnected,
+  ]);
+
   // B. Instantaneous Multi-Person Probability Score (0% to 100%)
   const multiPersonProb = useMemo(() => {
-    if (!isMotionActive && decorrelationSpread < 0.8) return 0;
+    if (!isMotionActive && decorrelationSpread < 0.8 && rfDecomp.estimatedPeopleInRadius === 0) return 0;
     const decorrScore = Math.min(100, Math.max(0, ((decorrelationSpread - 0.8) / (2.5 - 0.8)) * 100));
     const csiScore = Math.min(100, Math.max(0, ((csiVariance - 0.8) / 2.2) * 100));
     const rfEnergyScore = Math.min(100, Math.max(0, ((wifiVariance - triggerThreshold) / 2.5) * 100));
     return Math.min(100, Math.max(0, Math.round(decorrScore * 0.55 + csiScore * 0.30 + rfEnergyScore * 0.15)));
-  }, [isMotionActive, decorrelationSpread, csiVariance, wifiVariance, triggerThreshold]);
+  }, [isMotionActive, decorrelationSpread, csiVariance, wifiVariance, triggerThreshold, rfDecomp.estimatedPeopleInRadius]);
 
-  // C. Instantaneous Occupancy Classification (Matches AGENTS.md: <0.8 EMPTY, 0.8..2.5 SINGLE, >=2.5 MULTI)
+  // C. Instantaneous Occupancy Classification (Includes Stationary Respiration Lock)
   const occupancyState: "EMPTY" | "SINGLE" | "MULTI" = useMemo(() => {
-    if (!isMotionActive && decorrelationSpread < 0.8) return "EMPTY";
-    if (decorrelationSpread >= 2.5 || multiPersonProb >= 55) return "MULTI";
-    return "SINGLE";
-  }, [isMotionActive, decorrelationSpread, multiPersonProb]);
+    if (rfDecomp.estimatedPeopleInRadius >= 2 || decorrelationSpread >= 2.5 || multiPersonProb >= 55) {
+      return "MULTI";
+    }
+    if (isMotionActive || decorrelationSpread >= 0.8 || rfDecomp.estimatedPeopleInRadius >= 1) {
+      return "SINGLE";
+    }
+    return "EMPTY";
+  }, [isMotionActive, decorrelationSpread, multiPersonProb, rfDecomp.estimatedPeopleInRadius]);
 
   // D. Exact Leaky Bucket CUSUM Integrator: S_t = max(0, S_{t-1} + (variance - baseline) - leakRate)
   useEffect(() => {
@@ -634,6 +705,14 @@ export default function WifiMotionLab() {
             leakyBucketLevel={leakyBucketLevel}
             occupancyLimit={occupancyLimit}
             onSetOccupancyLimit={setOccupancyLimit}
+            selectedRadiusMeters={selectedRadiusMeters}
+            onSelectRadiusMeters={setSelectedRadiusMeters}
+            estimatedPeopleInRadius={rfDecomp.estimatedPeopleInRadius}
+            estimatedPetsInRadius={rfDecomp.estimatedPetsInRadius}
+            trackedEntities={rfDecomp.entities}
+            respirationBpm={rfDecomp.respirationBpm}
+            stationaryPresenceScore={rfDecomp.stationaryPresenceScore}
+            predictionStatusText={rfDecomp.predictionStatusText}
           />
         </main>
       ) : (
@@ -679,7 +758,7 @@ export default function WifiMotionLab() {
           </p>
         </div>
 
-        {/* Card 2: 64-Subcarrier CSI Variance */}
+        {/* Card 2: 64-Subcarrier CSI Engine */}
         <div className="p-4 rounded-xl bg-slate-900/60 border border-slate-800/80 backdrop-blur-md">
           <div className="flex items-center justify-between text-xs text-slate-400 mb-1.5">
             <span className="uppercase tracking-wider font-mono text-[10px] text-purple-400">
@@ -701,27 +780,38 @@ export default function WifiMotionLab() {
           </div>
         </div>
 
-        {/* Card 3: Room Motion Status */}
+        {/* Card 3: Room Motion & Stationary Lock Status */}
         <div className="p-4 rounded-xl bg-slate-900/60 border border-slate-800/80 backdrop-blur-md">
           <div className="flex items-center justify-between text-xs text-slate-400 mb-1.5">
             <span className="uppercase tracking-wider font-mono text-[10px] text-emerald-400">
-              Motion Status
+              People In {selectedRadiusMeters}m Radius
             </span>
             <span
               className={`px-1.5 py-0.2 rounded text-[10px] font-mono font-bold ${
                 isMotionActive
                   ? "bg-rose-500/20 text-rose-300 border border-rose-500/40"
+                  : rfDecomp.estimatedPeopleInRadius >= 1
+                  ? "bg-cyan-500/20 text-cyan-300 border border-cyan-500/40"
                   : "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
               }`}
             >
-              {isMotionActive ? "TARGET MOVING" : "ROOM QUIET"}
+              {isMotionActive
+                ? "TARGET MOVING"
+                : rfDecomp.estimatedPeopleInRadius >= 1
+                ? `STILL LOCK (${rfDecomp.respirationBpm} BPM)`
+                : "ROOM QUIET"}
             </span>
           </div>
           <p className="text-xl md:text-2xl font-bold font-mono text-slate-100">
-            {isMotionActive ? "MOTION" : "STATIONARY"}
+            {rfDecomp.estimatedPeopleInRadius}{" "}
+            <span className="text-xs font-normal text-slate-400">
+              {rfDecomp.estimatedPeopleInRadius === 1 ? "PERSON" : "PEOPLE"}
+              {rfDecomp.estimatedPetsInRadius > 0 ? ` + ${rfDecomp.estimatedPetsInRadius} PET` : ""}
+            </span>
           </p>
           <p className="text-[11px] text-slate-400 mt-2 font-mono border-t border-slate-800/60 pt-1.5">
-            Triggers Recorded: <strong className="text-cyan-300">{triggerCount}</strong>
+            Triggers: <strong className="text-cyan-300">{triggerCount}</strong> &bull; Stationary Score:{" "}
+            <strong className="text-cyan-300">{rfDecomp.stationaryPresenceScore}%</strong>
           </p>
         </div>
 
@@ -813,6 +903,16 @@ export default function WifiMotionLab() {
               wifiRssi={wifiRssi}
               baselineRssi={slowRssi}
               decorrelationSpread={decorrelationSpread}
+              trackedEntities={rfDecomp.entities}
+              selectedRadiusMeters={selectedRadiusMeters}
+              onSelectRadiusMeters={setSelectedRadiusMeters}
+              estimatedPeopleInRadius={rfDecomp.estimatedPeopleInRadius}
+              estimatedPetsInRadius={rfDecomp.estimatedPetsInRadius}
+              respirationBpm={rfDecomp.respirationBpm}
+              stationaryPresenceScore={rfDecomp.stationaryPresenceScore}
+              predictedNextRssi={rfDecomp.predictedNextRssi}
+              predictedNextVariance={rfDecomp.predictedNextVariance}
+              predictionStatusText={rfDecomp.predictionStatusText}
             />
           )}
 
@@ -852,7 +952,11 @@ export default function WifiMotionLab() {
               <span className="text-xs font-mono text-slate-300">
                 RADAR STATUS:{" "}
                 <strong className={isMotionActive ? "text-rose-400 font-bold" : "text-emerald-400 font-bold"}>
-                  {isMotionActive ? "MOTION DETECTED" : "ROOM QUIET & CLEAR"}
+                  {isMotionActive
+                    ? "MOTION DETECTED"
+                    : rfDecomp.estimatedPeopleInRadius >= 1
+                    ? "STATIONARY PERSON MAPPED"
+                    : "ROOM QUIET & CLEAR"}
                 </strong>
               </span>
               <span className="text-[11px] text-slate-500 font-mono">
@@ -1007,7 +1111,7 @@ export default function WifiMotionLab() {
                 <div className="flex items-center justify-between">
                   <h3 className="text-xs font-bold font-mono text-cyan-300 uppercase flex items-center gap-1.5">
                     <Users className="w-4 h-4 text-cyan-400" />
-                    Live Occupancy Sentinel Engine
+                    Live Occupancy Sentinel ({selectedRadiusMeters}m Radius)
                   </h3>
                   <div className="flex items-center gap-1 bg-slate-950 px-2 py-0.5 rounded border border-slate-800">
                     <span className="text-[10px] font-mono text-slate-400">Limit:</span>
@@ -1032,27 +1136,55 @@ export default function WifiMotionLab() {
 
                 <div className="grid grid-cols-2 gap-2">
                   <div className="p-3 rounded-lg bg-slate-950 border border-slate-800">
-                    <div className="text-[10px] text-slate-400 font-mono uppercase">Occupancy State</div>
+                    <div className="text-[10px] text-slate-400 font-mono uppercase">People in {selectedRadiusMeters}m</div>
                     <div
                       className={`text-xl font-bold font-mono mt-1 ${
-                        occupancyState === "MULTI"
+                        rfDecomp.estimatedPeopleInRadius >= 2
                           ? "text-rose-400"
-                          : occupancyState === "SINGLE"
+                          : rfDecomp.estimatedPeopleInRadius === 1
                           ? "text-cyan-300"
                           : "text-emerald-400"
                       }`}
                     >
-                      {occupancyState === "MULTI" ? "2+ PEOPLE" : occupancyState === "SINGLE" ? "1 PERSON" : "EMPTY (0)"}
+                      {rfDecomp.estimatedPeopleInRadius}{" "}
+                      <span className="text-xs font-normal text-slate-400">
+                        ({occupancyState})
+                      </span>
                     </div>
                   </div>
 
                   <div className="p-3 rounded-lg bg-slate-950 border border-slate-800">
-                    <div className="text-[10px] text-slate-400 font-mono uppercase">Multi-Body Probability</div>
-                    <div className="text-xl font-bold font-mono text-slate-100 mt-1">
-                      {multiPersonProb}%
+                    <div className="text-[10px] text-slate-400 font-mono uppercase">Stationary / Resp Lock</div>
+                    <div className="text-xl font-bold font-mono text-cyan-300 mt-1">
+                      {rfDecomp.stationaryPresenceScore}%{" "}
+                      <span className="text-[11px] font-normal text-slate-400">
+                        ({rfDecomp.respirationBpm} BPM)
+                      </span>
                     </div>
                   </div>
                 </div>
+
+                {/* Active Signal X & Signal Y Pointers */}
+                {rfDecomp.entities.length > 0 && (
+                  <div className="space-y-1.5">
+                    {rfDecomp.entities.map((ent) => (
+                      <div
+                        key={ent.id}
+                        className="p-2.5 rounded-lg bg-slate-950 border border-slate-800 flex items-center justify-between text-xs font-mono"
+                      >
+                        <div>
+                          <div className="font-bold text-cyan-300">{ent.designation}</div>
+                          <div className="text-[10px] text-slate-400">
+                            {ent.subcarrierBand} &bull; Range: {ent.rangeMeters}m @ {ent.angleDeg}°
+                          </div>
+                        </div>
+                        <span className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700 text-[10px] text-slate-200">
+                          {Math.round(ent.confidence * 100)}% CONF
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
 
                 {/* Subcarrier Decorrelation Math */}
                 <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 space-y-1">
@@ -1066,7 +1198,7 @@ export default function WifiMotionLab() {
                     </span>
                   </div>
                   <div className="text-[10px] text-slate-400 font-mono">
-                    Quiet room (&lt; 0.8). Single body coherent fading (0.8–2.5). Multiple simultaneous bodies (&ge; 2.5).
+                    Lower Band Var: {rfDecomp.lowerBandVariance} | Upper Band Var: {rfDecomp.upperBandVariance} | Static Residual: {rfDecomp.staticMultipathResidual}
                   </div>
                 </div>
 
