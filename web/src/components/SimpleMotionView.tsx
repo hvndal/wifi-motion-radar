@@ -87,7 +87,9 @@ export function SimpleMotionView({
   }, [isMoving]);
 
   // Compute friendly activity level percentage (0 to 100%)
-  const activityScore = Math.min(100, Math.round(variance * 12));
+  const activityScore = connected
+    ? Math.min(100, Math.round((variance * 28) + (decorrelationSpread * 8)))
+    : 0;
 
   return (
     <div className="flex flex-col gap-5 w-full max-w-4xl mx-auto">
@@ -312,12 +314,12 @@ export function SimpleMotionView({
             <div className="my-2">
               <span
                 className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-mono font-bold ${
-                  (occupancyLimit === 1 && occupancyState === "MULTI") || leakyBucketLevel > 50
+                  (occupancyLimit === 1 && occupancyState === "MULTI") || leakyBucketLevel >= 60
                     ? "bg-rose-500/20 text-rose-300 border border-rose-500/50 animate-pulse"
                     : "bg-emerald-500/20 text-emerald-300 border border-emerald-500/50"
                 }`}
               >
-                {(occupancyLimit === 1 && occupancyState === "MULTI") || leakyBucketLevel > 50 ? (
+                {(occupancyLimit === 1 && occupancyState === "MULTI") || leakyBucketLevel >= 60 ? (
                   <>
                     <ShieldAlert className="w-3.5 h-3.5 text-rose-400" />
                     <span>LIMIT EXCEEDED</span>
@@ -331,7 +333,7 @@ export function SimpleMotionView({
               </span>
             </div>
             <div className="text-[11px] font-mono text-slate-400">
-              {(occupancyLimit === 1 && occupancyState === "MULTI") || leakyBucketLevel > 50
+              {(occupancyLimit === 1 && occupancyState === "MULTI") || leakyBucketLevel >= 60
                 ? "Sustained crowd signature detected"
                 : `Allowed: Up to ${occupancyLimit} guest${occupancyLimit > 1 ? "s" : ""}`}
             </div>
@@ -343,13 +345,15 @@ export function SimpleMotionView({
               RF Phase Decorrelation
             </span>
             <div className="my-2 text-2xl font-black font-mono text-purple-300">
-              {decorrelationSpread.toFixed(1)}{" "}
+              {decorrelationSpread.toFixed(2)}{" "}
               <span className="text-xs font-normal text-slate-500">&sigma;&sup2;&Delta;</span>
             </div>
             <div className="text-[11px] font-mono text-slate-400">
-              {decorrelationSpread > 16
-                ? "High decorrelation (Multiple bodies)"
-                : "Low/coherent (Single reflector)"}
+              {decorrelationSpread >= 2.5
+                ? "High decorrelation (Multiple bodies >= 2.5)"
+                : decorrelationSpread >= 0.8
+                ? "Coherent scatter (Single reflector 0.8-2.5)"
+                : "Quiet baseline (< 0.8)"}
             </div>
           </div>
         </div>

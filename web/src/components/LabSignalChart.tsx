@@ -60,9 +60,18 @@ export default function LabSignalChart({ data, baseline, threshold }: ChartProps
       return;
     }
 
-    // Baseline & Threshold Reference Lines
-    // Variance scale: 0 to 20 mapped to canvas height
-    const mapVarY = (v: number) => height - 10 - Math.min(height - 20, (v / 18.0) * (height - 30));
+    const maxPoints = 60;
+    const recent = data.slice(-maxPoints);
+    const stepX = width / (maxPoints - 1);
+
+    // Dynamic Y-Axis Scale: adapts smoothly to room sensitivity & live disturbance peaks
+    const peakDataVar = recent.reduce(
+      (max, pt) => Math.max(max, pt.wifiVariance, (pt.csiVariance || 0) * 1.2, pt.phoneAccel * 0.5),
+      0
+    );
+    const dynamicMaxY = Math.max(3.0, threshold * 2.2, peakDataVar * 1.25);
+    const mapVarY = (v: number) =>
+      height - 12 - Math.min(height - 24, (Math.max(0, v) / dynamicMaxY) * (height - 34));
 
     // Draw Threshold Line
     const threshY = mapVarY(threshold);
@@ -77,7 +86,7 @@ export default function LabSignalChart({ data, baseline, threshold }: ChartProps
     ctx.fillStyle = "#f43f5e";
     ctx.font = "9px monospace";
     ctx.textAlign = "right";
-    ctx.fillText(`Trigger Threshold (${threshold.toFixed(1)} dB²)`, width - 8, threshY - 4);
+    ctx.fillText(`Trigger Threshold (${threshold.toFixed(2)} dB²)`, width - 8, threshY - 4);
 
     // Baseline Line
     const baseY = mapVarY(baseline);
@@ -89,17 +98,13 @@ export default function LabSignalChart({ data, baseline, threshold }: ChartProps
     ctx.stroke();
     ctx.setLineDash([]);
 
-    const maxPoints = 60;
-    const recent = data.slice(-maxPoints);
-    const stepX = width / (maxPoints - 1);
-
     // 1. Draw CSI Variance (Emerald #10b981)
     ctx.strokeStyle = "#10b981";
     ctx.lineWidth = 1.5;
     ctx.beginPath();
     recent.forEach((pt, i) => {
       const cv = pt.csiVariance || 0;
-      const cy = mapVarY(cv * 2.0); // scaled for clear visibility
+      const cy = mapVarY(cv);
       const px = i * stepX;
       if (i === 0) ctx.moveTo(px, cy);
       else ctx.lineTo(px, cy);
@@ -111,7 +116,7 @@ export default function LabSignalChart({ data, baseline, threshold }: ChartProps
     ctx.lineWidth = 2;
     ctx.beginPath();
     recent.forEach((pt, i) => {
-      const py = height - 10 - Math.min(height - 20, (pt.phoneAccel / 18.0) * (height - 30));
+      const py = mapVarY(pt.phoneAccel * 0.4);
       const px = i * stepX;
       if (i === 0) ctx.moveTo(px, py);
       else ctx.lineTo(px, py);
@@ -143,7 +148,7 @@ export default function LabSignalChart({ data, baseline, threshold }: ChartProps
 
     // CSI Dot
     if (last.csiVariance !== undefined) {
-      const lastCsiY = mapVarY((last.csiVariance || 0) * 2.0);
+      const lastCsiY = mapVarY(last.csiVariance || 0);
       ctx.fillStyle = "#10b981";
       ctx.beginPath();
       ctx.arc(lastX, lastCsiY, 3.5, 0, Math.PI * 2);
@@ -151,7 +156,7 @@ export default function LabSignalChart({ data, baseline, threshold }: ChartProps
     }
 
     // Phone Dot
-    const lastPhoneY = height - 10 - Math.min(height - 20, (last.phoneAccel / 18.0) * (height - 30));
+    const lastPhoneY = mapVarY(last.phoneAccel * 0.4);
     ctx.fillStyle = "#a855f7";
     ctx.beginPath();
     ctx.arc(lastX, lastPhoneY, 4, 0, Math.PI * 2);

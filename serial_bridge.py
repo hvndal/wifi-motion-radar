@@ -1,14 +1,23 @@
 import sys
 import time
 import json
-import urllib.request
 import serial
 import serial.tools.list_ports
+
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    import urllib.request
+    HAS_REQUESTS = False
 
 BAUD = 115200
 API_URL = "http://localhost:3000/api/esp32"
 
-print("[BRIDGE] Starting Auto-Detecting ESP32 Serial Bridge...", flush=True)
+print("[BRIDGE] Starting High-Precision ESP32 Serial Bridge (10 Hz)...", flush=True)
+
+session = requests.Session() if HAS_REQUESTS else None
+
 
 def find_esp32_port():
     ports = serial.tools.list_ports.comports()
@@ -23,14 +32,21 @@ def find_esp32_port():
     # 2. Fallback to first available port
     return ports[0].device
 
+
 def post_telemetry(payload):
     try:
-        data = json.dumps(payload).encode('utf-8')
-        req = urllib.request.Request(API_URL, data=data, headers={'Content-Type': 'application/json'})
-        with urllib.request.urlopen(req, timeout=0.2) as resp:
-            pass
+        if HAS_REQUESTS and session is not None:
+            session.post(API_URL, json=payload, timeout=0.25)
+        else:
+            data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(
+                API_URL, data=data, headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=0.25):
+                pass
     except Exception:
         pass
+
 
 def main():
     waiting_announced = False
@@ -55,27 +71,42 @@ def main():
             ser.rts = False
             ser.timeout = 1.0
             ser.open()
-            print(f"[BRIDGE] Successfully linked to ESP32 on {port}! Streaming data to {API_URL}...", flush=True)
+            print(f"[BRIDGE] Linked to ESP32 on {port}! Streaming telemetry to {API_URL}...", flush=True)
 
             while True:
-                line = ser.readline().decode('utf-8', errors='ignore').strip()
-                if not line or not line.startswith('{'):
+                raw_bytes = ser.readline()
+                if not raw_bytes:
+                    continue
+                line = raw_bytes.decode("utf-8", errors="ignore").strip()
+                if not line or not line.startswith("{"):
                     continue
 
                 try:
                     parsed = json.loads(line)
+                    # Ignore status boot messages that only contain "msg"
+                    if "msg" in parsed and "rssi" not in parsed:
+                        print(f"[ESP32] {parsed['msg']}", flush=True)
+                        continue
+
                     payload = {
-                        "ip": f"{port} (USB Auto-Link)",
-                        "rssi": parsed.get("rssi", -50),
-                        "variance": parsed.get("variance", 0.0),
-                        "csiVariance": parsed.get("csiVariance", 0.0),
-                        "motion": parsed.get("motion", False),
-                        "triggerCount": parsed.get("triggers", 0),
+                        "ip": f"{port} (Ch{parsed.get('channel', 8)})",
+                        "rssi": float(parsed.get("rssi", -60.0)),
+                        "fastRssi": float(parsed.get("fastRssi", parsed.get("rssi", -60.0))),
+                        "slowRssi": float(parsed.get("slowRssi", parsed.get("rssi", -60.0))),
+                        "variance": float(parsed.get("variance", 0.0)),
+                        "noiseFloor": float(parsed.get("noiseFloor", 0.18)),
+                        "snr": float(parsed.get("snr", 1.0)),
+                        "csiVariance": float(parsed.get("csiVariance", 0.0)),
+                        "decorrelation": float(parsed.get("decorrelation", 0.0)),
+                        "motion": bool(parsed.get("motion", False)),
+                        "triggerCount": int(parsed.get("triggers", 0)),
                         "subcarriers": parsed.get("subcarriers", []),
-                        "locked": parsed.get("locked", False)
+                        "locked": bool(parsed.get("locked", True)),
+                        "beacons": int(parsed.get("beacons", 0)),
+                        "channel": int(parsed.get("channel", 8)),
                     }
                     post_telemetry(payload)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, ValueError):
                     pass
         except serial.SerialException as se:
             print(f"[BRIDGE] Serial port {port} disconnected ({se}). Waiting for reconnect...", flush=True)
@@ -83,6 +114,7 @@ def main():
         except Exception as e:
             print(f"[BRIDGE] Connection error: {e}. Retrying...", flush=True)
             time.sleep(1)
+
 
 if __name__ == "__main__":
     main()

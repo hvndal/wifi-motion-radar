@@ -1,7 +1,19 @@
 "use client";
 
 import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
-import { Radar, Crosshair, Volume2, VolumeX, ShieldAlert, Navigation, Zap, Radio, Wifi, Compass, Sliders } from "lucide-react";
+import {
+  Radar,
+  Crosshair,
+  Volume2,
+  VolumeX,
+  ShieldAlert,
+  Navigation,
+  Zap,
+  Radio,
+  Wifi,
+  Compass,
+  Sliders,
+} from "lucide-react";
 
 interface RadarBlip {
   id: string;
@@ -26,6 +38,8 @@ interface UavTacticalRadarProps {
   isPhoneStreaming: boolean;
   soundEnabled: boolean;
   wifiRssi?: number;
+  baselineRssi?: number;
+  decorrelationSpread?: number;
 }
 
 export function UavTacticalRadar({
@@ -36,128 +50,260 @@ export function UavTacticalRadar({
   phoneTag,
   isPhoneStreaming,
   soundEnabled,
-  wifiRssi = -64,
+  wifiRssi = -60.0,
+  baselineRssi = -60.0,
+  decorrelationSpread = 0.4,
 }: UavTacticalRadarProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const audioCtxRef = useRef<AudioContext | null>(null);
 
   // Radar Settings
   const [uavMode, setUavMode] = useState<"standard" | "advanced">("standard");
-  const [maxRangeMeters, setMaxRangeMeters] = useState<number>(6.0);
+  const [maxRangeMeters, setMaxRangeMeters] = useState<number>(8.0);
   const [sweepDurationSec, setSweepDurationSec] = useState<number>(3.0);
   const [radarMuted, setRadarMuted] = useState<boolean>(false);
   const [contacts, setContacts] = useState<RadarBlip[]>([]);
 
-  // Physical Node Placement Geometry
-  // Calculate RF physical distance via Log-Distance Path Loss model: d = 10 ^ ((P_tx - RSSI) / (10 * n))
-  const estimatedPhysicalDistance = useMemo(() => {
-    // Reference RSSI at 1m in indoor space = -42 dBm, Path loss exponent n = 2.4
-    const d = Math.pow(10, (-42 - wifiRssi) / (10 * 2.4));
-    return Math.max(1.2, Math.min(10.0, parseFloat(d.toFixed(1))));
-  }, [wifiRssi]);
-
+  // Calibrated Log-Distance Path Loss Model Parameters
+  // d = 10 ^ ((A - RSSI) / (10 * n))
+  const [refRssi1m, setRefRssi1m] = useState<number>(-42.0);
+  const [pathLossExp, setPathLossExp] = useState<number>(2.4);
   const [routerDistanceMeters, setRouterDistanceMeters] = useState<number>(4.0);
   const [routerBearingDeg, setRouterBearingDeg] = useState<number>(90); // 90° = North / In front of desk
   const [autoRssiDistance, setAutoRssiDistance] = useState<boolean>(true);
+  const [showPathLossTuning, setShowPathLossTuning] = useState<boolean>(false);
+
+  // Load saved geometry calibration from localStorage on mount
+  useEffect(() => {
+    try {
+      const savedBearing = localStorage.getItem("uav_router_bearing");
+      const savedRefRssi = localStorage.getItem("uav_ref_rssi_1m");
+      const savedPathLoss = localStorage.getItem("uav_path_loss_n");
+      const savedAutoDist = localStorage.getItem("uav_auto_rssi_dist");
+      const savedManualDist = localStorage.getItem("uav_manual_dist");
+
+      if (savedBearing !== null) setRouterBearingDeg(Number(savedBearing));
+      if (savedRefRssi !== null) setRefRssi1m(Number(savedRefRssi));
+      if (savedPathLoss !== null) setPathLossExp(Number(savedPathLoss));
+      if (savedAutoDist !== null) setAutoRssiDistance(savedAutoDist === "true");
+      if (savedManualDist !== null) setRouterDistanceMeters(Number(savedManualDist));
+    } catch {
+      // Ignore storage errors
+    }
+  }, []);
+
+  const handleBearingChange = (deg: number) => {
+    setRouterBearingDeg(deg);
+    try {
+      localStorage.setItem("uav_router_bearing", String(deg));
+    } catch {}
+  };
+
+  // Smooth RSSI with EMA to prevent distance jumping on the polar plot
+  const smoothedRssiRef = useRef<number>(wifiRssi);
+  useEffect(() => {
+    if (wifiRssi < -10 && wifiRssi > -98) {
+      smoothedRssiRef.current = 0.25 * wifiRssi + 0.75 * smoothedRssiRef.current;
+    }
+  }, [wifiRssi]);
+
+  // Calculate RF physical distance via Log-Distance Path Loss model: d = 10 ^ ((A - RSSI) / (10 * n))
+  const estimatedPhysicalDistance = useMemo(() => {
+    const effectiveRssi =
+      baselineRssi < -10 && !isMotionDetected ? baselineRssi : smoothedRssiRef.current;
+    const d = Math.pow(10, (refRssi1m - effectiveRssi) / (10 * pathLossExp));
+    return Math.max(1.0, Math.min(14.0, parseFloat(d.toFixed(2))));
+  }, [wifiRssi, baselineRssi, isMotionDetected, refRssi1m, pathLossExp]);
 
   const activeRouterDist = autoRssiDistance ? estimatedPhysicalDistance : routerDistanceMeters;
 
-  // Telemetry HUD state
-  const [lastPingTime, setLastPingTime] = useState<number>(0);
-  const [targetCount, setTargetCount] = useState<number>(0);
-  const [activeSector, setActiveSector] = useState<string>("NONE");
+  // Compute physical 1st Fresnel Zone radius (semi-minor axis in meters): r1 = sqrt((lambda * d) / 4)
+  // At 2.437 GHz (Channel 6/8), wavelength lambda = 0.123 meters
+  const fresnelRadiusMeters = useMemo(() => {
+    const lambda = 0.123;
+    return parseFloat(Math.sqrt((lambda * activeRouterDist) / 4.0).toFixed(2));
+  }, [activeRouterDist]);
 
-  // Keep references for animation loop
+  // Telemetry HUD state
+  const [targetCount, setTargetCount] = useState<number>(0);
+  const [activeSector, setActiveSector] = useState<string>("STATIC / PERIMETER CLEAR");
+
+  // Keep references for animation loop so Canvas always reads live geometry without stale closures!
   const angleRef = useRef<number>(0);
   const blipsRef = useRef<RadarBlip[]>([]);
   const lastTimeRef = useRef<number>(0);
   const lastBeepTimeRef = useRef<number>(0);
+  const smoothedTargetRangeRef = useRef<number>(activeRouterDist * 0.5);
+  const geometryRef = useRef({
+    activeRouterDist,
+    routerBearingDeg,
+    fresnelRadiusMeters,
+    isMotionDetected,
+    wifiVariance,
+    csiVariance,
+  });
+
+  useEffect(() => {
+    geometryRef.current = {
+      activeRouterDist,
+      routerBearingDeg,
+      fresnelRadiusMeters,
+      isMotionDetected,
+      wifiVariance,
+      csiVariance,
+    };
+  }, [
+    activeRouterDist,
+    routerBearingDeg,
+    fresnelRadiusMeters,
+    isMotionDetected,
+    wifiVariance,
+    csiVariance,
+  ]);
 
   // Initialize Tactical Radar Synth Audio
-  const playRadarBeep = useCallback((freq = 880, duration = 0.08) => {
-    if (radarMuted || !soundEnabled) return;
-    try {
-      if (!audioCtxRef.current) {
-        const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-        audioCtxRef.current = new AudioCtx();
+  const playRadarBeep = useCallback(
+    (freq = 880, duration = 0.08) => {
+      if (radarMuted || !soundEnabled) return;
+      try {
+        if (!audioCtxRef.current) {
+          const AudioCtx =
+            window.AudioContext ||
+            (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+          audioCtxRef.current = new AudioCtx();
+        }
+        if (audioCtxRef.current.state === "suspended") {
+          audioCtxRef.current.resume();
+        }
+
+        const ctx = audioCtxRef.current;
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(freq, ctx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(freq * 0.5, ctx.currentTime + duration);
+
+        gain.gain.setValueAtTime(0.12, ctx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
+
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+
+        osc.start();
+        osc.stop(ctx.currentTime + duration);
+      } catch {
+        // AudioContext policy catch
       }
-      if (audioCtxRef.current.state === "suspended") {
-        audioCtxRef.current.resume();
-      }
+    },
+    [radarMuted, soundEnabled]
+  );
 
-      const ctx = audioCtxRef.current;
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-
-      osc.type = "sine";
-      osc.frequency.setValueAtTime(freq, ctx.currentTime);
-      osc.frequency.exponentialRampToValueAtTime(freq * 0.5, ctx.currentTime + duration);
-
-      gain.gain.setValueAtTime(0.12, ctx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + duration);
-
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-
-      osc.start();
-      osc.stop(ctx.currentTime + duration);
-    } catch {
-      // AudioContext policy catch
-    }
-  }, [radarMuted, soundEnabled]);
-
-  // Generate / Update Blips based on physical RF multipath & Doppler features
+  // Generate / Update Blips based on physical RF multipath & Diffraction Physics
   useEffect(() => {
     const now = performance.now();
     const existing = [...blipsRef.current];
 
-    // ONLY display a target blip when real physical motion is detected!
     if (isMotionDetected) {
-      // Map physical range from measured RF perturbation (stronger disturbance = closer to sensor/baseline)
-      const normalizedPerturbation = Math.min(1.0, wifiVariance / 15.0);
-      const estRange = Math.max(0.6, (1.0 - normalizedPerturbation * 0.5) * (activeRouterDist * 0.75));
-      const estVelocity = Number((wifiVariance * 0.12).toFixed(2));
+      // 1. Diffraction & Shadowing Localization Model along the LoS Corridor:
+      // - Deep RSSI drop (high wifiVariance relative to CSI) => Body is near the direct Line-of-Sight midpoint (0.5 * d)
+      // - High CSI variance with low RSSI drop => Body is moving near the ESP32 desk receiver (0.25 * d)
+      // - Moderate RSSI & CSI disturbance => Body is between midpoint and router (0.65 * d)
+      const rssiShadowDepth = Math.abs(wifiRssi - baselineRssi);
+      const perturbationIntensity = Math.min(1.0, (wifiVariance + csiVariance * 0.6) / 6.0);
 
-      // Target blip is oriented along the physical router-ESP32 corridor with slight multipath angular spread
+      let fractionalPos = 0.5; // Default to Fresnel Zone center
+      if (csiVariance > 1.2 && wifiVariance < 1.2) {
+        // Near-field desk movement
+        fractionalPos = 0.28;
+      } else if (rssiShadowDepth > 2.5 || wifiVariance > 2.2) {
+        // Direct Line-of-Sight occlusion near Fresnel core
+        fractionalPos = 0.48 - Math.min(0.2, perturbationIntensity * 0.15);
+      } else {
+        // Outer Fresnel reflection zone
+        fractionalPos = 0.62;
+      }
+
+      const rawTargetRange = Math.max(0.5, Math.min(activeRouterDist * 0.92, activeRouterDist * fractionalPos));
+      // Smooth range with 1D kinematic filter
+      smoothedTargetRangeRef.current =
+        0.35 * rawTargetRange + 0.65 * smoothedTargetRangeRef.current;
+      const estRange = Number(smoothedTargetRangeRef.current.toFixed(2));
+
+      // Estimate radial velocity from CSI Doppler fluctuation
+      const estVelocity = Number((Math.sqrt(wifiVariance) * 0.22 + csiVariance * 0.18).toFixed(2));
+
+      // Target angle oriented along the Router-ESP32 Fresnel corridor
       const targetAngle = routerBearingDeg;
       const rad = (targetAngle * Math.PI) / 180;
-      const normDist = Math.min(0.9, estRange / maxRangeMeters);
+      const normDist = Math.min(0.92, estRange / maxRangeMeters);
       const targetX = Math.cos(rad) * normDist;
       const targetY = -Math.sin(rad) * normDist;
 
-      const targetIndex = existing.findIndex((b) => b.type === "hostile");
+      const targetIndex = existing.findIndex((b) => b.id === "target-human-01");
+      const confidence = Math.min(0.99, Number((0.72 + perturbationIntensity * 0.26).toFixed(2)));
+
       if (targetIndex >= 0) {
         existing[targetIndex] = {
           ...existing[targetIndex],
           x: targetX,
           y: targetY,
-          rangeMeters: Number(estRange.toFixed(1)),
+          rangeMeters: estRange,
           angleDeg: targetAngle,
           intensity: 1.0,
           lastPingedAt: now,
           velocityMs: estVelocity,
-          confidence: Math.min(0.98, 0.7 + normalizedPerturbation * 0.25),
+          confidence,
         };
       } else {
         existing.push({
           id: "target-human-01",
           x: targetX,
           y: targetY,
-          rangeMeters: Number(estRange.toFixed(1)),
+          rangeMeters: estRange,
           angleDeg: targetAngle,
           intensity: 1.0,
           firstDetectedAt: now,
           lastPingedAt: now,
           type: "hostile",
           velocityMs: estVelocity,
-          confidence: 0.88,
+          confidence,
         });
       }
+
+      // If high subcarrier phase decorrelation indicates a 2nd simultaneous moving body, plot secondary scatter contact
+      if (decorrelationSpread >= 2.2) {
+        const secAngle = (routerBearingDeg + 18) % 360;
+        const secRad = (secAngle * Math.PI) / 180;
+        const secRange = Number(Math.min(activeRouterDist * 0.85, estRange * 1.25).toFixed(2));
+        const secNorm = Math.min(0.92, secRange / maxRangeMeters);
+        const secIdx = existing.findIndex((b) => b.id === "target-human-02");
+        const secBlip: RadarBlip = {
+          id: "target-human-02",
+          x: Math.cos(secRad) * secNorm,
+          y: -Math.sin(secRad) * secNorm,
+          rangeMeters: secRange,
+          angleDeg: secAngle,
+          intensity: 0.9,
+          firstDetectedAt: secIdx >= 0 ? existing[secIdx].firstDetectedAt : now,
+          lastPingedAt: now,
+          type: "hostile",
+          velocityMs: Number((estVelocity * 0.85).toFixed(2)),
+          confidence: 0.82,
+        };
+        if (secIdx >= 0) existing[secIdx] = secBlip;
+        else existing.push(secBlip);
+      } else {
+        const secIdx = existing.findIndex((b) => b.id === "target-human-02");
+        if (secIdx >= 0 && now - existing[secIdx].lastPingedAt > 1200) {
+          existing.splice(secIdx, 1);
+        }
+      }
     } else {
-      // Room is STILL: Purge hostile target blips after 1.5 seconds! Room returns to 100% CLEAR!
+      // Room is STILL: Purge hostile target blips after 1.4 seconds
       const filtered = existing.filter((b) => {
         if (b.type === "hostile") {
-          return now - b.lastPingedAt < 1500;
+          return now - b.lastPingedAt < 1400;
         }
         return true;
       });
@@ -168,7 +314,7 @@ export function UavTacticalRadar({
     // If Phone Ground Truth is connected, add Friendly Tagged Blip
     if (isPhoneStreaming) {
       const phoneNormDist = 0.45;
-      const phoneAngle = 210; // Bottom-left sector
+      const phoneAngle = (routerBearingDeg + 315) % 360;
       const rad = (phoneAngle * Math.PI) / 180;
       const phoneX = Math.cos(rad) * phoneNormDist;
       const phoneY = -Math.sin(rad) * phoneNormDist;
@@ -177,6 +323,8 @@ export function UavTacticalRadar({
       if (phoneIndex >= 0) {
         existing[phoneIndex] = {
           ...existing[phoneIndex],
+          x: phoneX,
+          y: phoneY,
           intensity: 1.0,
           lastPingedAt: now,
           velocityMs: Number((phoneAccelMag * 0.2).toFixed(2)),
@@ -201,7 +349,19 @@ export function UavTacticalRadar({
     blipsRef.current = existing;
     setContacts([...existing]);
     setTargetCount(existing.length);
-  }, [wifiVariance, csiVariance, isMotionDetected, isPhoneStreaming, phoneAccelMag, maxRangeMeters]);
+  }, [
+    wifiVariance,
+    csiVariance,
+    isMotionDetected,
+    isPhoneStreaming,
+    phoneAccelMag,
+    maxRangeMeters,
+    activeRouterDist,
+    routerBearingDeg,
+    wifiRssi,
+    baselineRssi,
+    decorrelationSpread,
+  ]);
 
   // Main Radar Canvas Render & Sweep Animation Loop
   useEffect(() => {
@@ -224,6 +384,13 @@ export function UavTacticalRadar({
         return;
       }
 
+      const {
+        activeRouterDist: curRouterDist,
+        routerBearingDeg: curBearingDeg,
+        fresnelRadiusMeters: curFresnelMeters,
+        isMotionDetected: curMotion,
+      } = geometryRef.current;
+
       const w = canvas.width;
       const h = canvas.height;
       const cx = w / 2;
@@ -236,7 +403,7 @@ export function UavTacticalRadar({
       const sweepAngle = angleRef.current;
 
       // 1. Dark Radar Background
-      ctx.fillStyle = "#030712"; // Deep space void
+      ctx.fillStyle = "#030712";
       ctx.fillRect(0, 0, w, h);
 
       // 2. Tactical Circular Radar Grids
@@ -245,7 +412,7 @@ export function UavTacticalRadar({
         const r = (radius / numRings) * i;
         ctx.beginPath();
         ctx.arc(cx, cy, r, 0, Math.PI * 2);
-        ctx.strokeStyle = i === numRings ? "#38bdf8" : "#0284c7"; // Cyan tactical grid
+        ctx.strokeStyle = i === numRings ? "#38bdf8" : "#0284c7";
         ctx.lineWidth = i === numRings ? 2 : 1;
         ctx.globalAlpha = i === numRings ? 0.35 : 0.18;
         ctx.stroke();
@@ -258,54 +425,83 @@ export function UavTacticalRadar({
         ctx.fillText(`${ringMeters}m`, cx + 6, cy - r + 11);
       }
 
-      // 3. Radial Crosshairs & Angle Rays
-      const angles = [0, 45, 90, 135, 180, 225, 270, 315];
-      angles.forEach((deg) => {
+      // 3. Radial Crosshairs & Compass Bearings (0°=E, 90°=N, 180°=W, 270°=S)
+      const angles = [
+        { deg: 0, label: "E (0°)" },
+        { deg: 45, label: "45°" },
+        { deg: 90, label: "N (90°)" },
+        { deg: 135, label: "135°" },
+        { deg: 180, label: "W (180°)" },
+        { deg: 225, label: "225°" },
+        { deg: 270, label: "S (270°)" },
+        { deg: 315, label: "315°" },
+      ];
+      angles.forEach(({ deg, label }) => {
         const rad = (deg * Math.PI) / 180;
         ctx.beginPath();
         ctx.moveTo(cx, cy);
-        ctx.lineTo(cx + Math.cos(rad) * radius, cy + Math.sin(rad) * radius);
+        ctx.lineTo(cx + Math.cos(rad) * radius, cy - Math.sin(rad) * radius);
         ctx.strokeStyle = "#0284c7";
         ctx.lineWidth = 1;
-        ctx.globalAlpha = deg % 90 === 0 ? 0.25 : 0.12;
+        ctx.globalAlpha = deg % 90 === 0 ? 0.28 : 0.12;
         ctx.stroke();
 
         // Outer angle ticks
-        const tx = cx + Math.cos(rad) * (radius + 12);
-        const ty = cy + Math.sin(rad) * (radius + 12);
-        ctx.globalAlpha = 0.5;
-        ctx.fillStyle = "#64748b";
-        ctx.font = "8px monospace";
+        const tx = cx + Math.cos(rad) * (radius + 13);
+        const ty = cy - Math.sin(rad) * (radius + 13);
+        ctx.globalAlpha = deg % 90 === 0 ? 0.75 : 0.45;
+        ctx.fillStyle = deg % 90 === 0 ? "#38bdf8" : "#64748b";
+        ctx.font = deg % 90 === 0 ? "bold 8px monospace" : "8px monospace";
         ctx.textAlign = "center";
         ctx.textBaseline = "middle";
-        ctx.fillText(`${deg}°`, tx, ty);
+        ctx.fillText(label, tx, ty);
       });
 
       // 4. Draw Physical Hardware Nodes: Router (Tx) and ESP32 Sentinel (Rx)
-      // A. ESP32 Sentinel (Receiver / Origin at Center)
-      ctx.beginPath();
-      ctx.arc(cx, cy, 7, 0, Math.PI * 2);
-      ctx.fillStyle = "#06b6d4"; // Cyan
-      ctx.globalAlpha = 0.95;
-      ctx.fill();
-      ctx.strokeStyle = "#ffffff";
-      ctx.lineWidth = 2;
-      ctx.stroke();
-
-      ctx.fillStyle = "#22d3ee";
-      ctx.font = "bold 9px monospace";
-      ctx.textAlign = "center";
-      ctx.fillText("ESP32 (LAPTOP)", cx, cy + 20);
-
       // B. Wi-Fi Router (Tx) Node placed at exact physical distance and bearing
-      const routerRad = (routerBearingDeg * Math.PI) / 180;
-      const routerNormDist = Math.min(0.92, activeRouterDist / maxRangeMeters);
+      const routerRad = (curBearingDeg * Math.PI) / 180;
+      const routerNormDist = Math.min(0.92, curRouterDist / maxRangeMeters);
       const routerX = cx + Math.cos(routerRad) * (radius * routerNormDist);
       const routerY = cy - Math.sin(routerRad) * (radius * routerNormDist);
 
+      // C. 1st Fresnel Zone Elliptical Sensing Corridor (True Physics Formula: r1 = sqrt(lambda * d / 4))
+      const midX = (cx + routerX) / 2;
+      const midY = (cy + routerY) / 2;
+      const baselinePx = Math.sqrt((routerX - cx) ** 2 + (routerY - cy) ** 2);
+      const pxPerMeter = radius / maxRangeMeters;
+      const ellipseSemiMajor = Math.max(12, baselinePx / 2);
+      const ellipseSemiMinor = Math.max(12, curFresnelMeters * pxPerMeter * 1.8);
+      const ellipseAngle = Math.atan2(routerY - cy, routerX - cx);
+
+      ctx.save();
+      ctx.translate(midX, midY);
+      ctx.rotate(ellipseAngle);
       ctx.beginPath();
-      ctx.arc(routerX, routerY, 6, 0, Math.PI * 2);
-      ctx.fillStyle = "#a855f7"; // Purple Router Node
+      ctx.ellipse(0, 0, ellipseSemiMajor, ellipseSemiMinor, 0, 0, Math.PI * 2);
+      ctx.strokeStyle = curMotion ? "#f43f5e" : "#a855f7";
+      ctx.lineWidth = curMotion ? 1.8 : 1.2;
+      ctx.globalAlpha = curMotion ? 0.55 : 0.28;
+      ctx.stroke();
+      ctx.fillStyle = curMotion ? "#f43f5e" : "#a855f7";
+      ctx.globalAlpha = curMotion ? 0.12 : 0.05;
+      ctx.fill();
+      ctx.restore();
+
+      // Direct Line-of-Sight Beam
+      ctx.beginPath();
+      ctx.setLineDash([4, 4]);
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(routerX, routerY);
+      ctx.strokeStyle = curMotion ? "#fb7185" : "#c084fc";
+      ctx.lineWidth = 1.5;
+      ctx.globalAlpha = 0.55;
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Draw Router (Tx) Node
+      ctx.beginPath();
+      ctx.arc(routerX, routerY, 6.5, 0, Math.PI * 2);
+      ctx.fillStyle = "#a855f7";
       ctx.globalAlpha = 0.95;
       ctx.fill();
       ctx.strokeStyle = "#f3e8ff";
@@ -315,43 +511,25 @@ export function UavTacticalRadar({
       ctx.fillStyle = "#e9d5ff";
       ctx.font = "bold 9px monospace";
       ctx.textAlign = "center";
-      ctx.fillText(`ROUTER (${activeRouterDist}m)`, routerX, routerY - 12);
+      ctx.fillText(`ROUTER TX (${curRouterDist.toFixed(1)}m)`, routerX, routerY - 12);
 
-      // C. 1st Fresnel Zone Elliptical Sensing Corridor (Physical Radio Path)
+      // Draw ESP32 Sentinel (Receiver / Origin at Center)
       ctx.beginPath();
-      ctx.setLineDash([4, 4]);
-      ctx.moveTo(cx, cy);
-      ctx.lineTo(routerX, routerY);
-      ctx.strokeStyle = "#c084fc";
-      ctx.lineWidth = 1.5;
-      ctx.globalAlpha = 0.45;
-      ctx.stroke();
-      ctx.setLineDash([]); // Reset dash
-
-      // Draw 1st Fresnel Zone Ellipse around the baseline path
-      const midX = (cx + routerX) / 2;
-      const midY = (cy + routerY) / 2;
-      const baselineLength = Math.sqrt((routerX - cx) ** 2 + (routerY - cy) ** 2);
-      const ellipseSemiMajor = baselineLength / 2 + 10;
-      const ellipseSemiMinor = Math.max(16, baselineLength * 0.22); // ~1st Fresnel radius at 2.4 GHz
-      const ellipseAngle = Math.atan2(routerY - cy, routerX - cx);
-
-      ctx.save();
-      ctx.translate(midX, midY);
-      ctx.rotate(ellipseAngle);
-      ctx.beginPath();
-      ctx.ellipse(0, 0, ellipseSemiMajor, ellipseSemiMinor, 0, 0, Math.PI * 2);
-      ctx.strokeStyle = "#a855f7";
-      ctx.lineWidth = 1;
-      ctx.globalAlpha = 0.22;
-      ctx.stroke();
-      ctx.fillStyle = "#a855f7";
-      ctx.globalAlpha = 0.04;
+      ctx.arc(cx, cy, 7, 0, Math.PI * 2);
+      ctx.fillStyle = "#06b6d4";
+      ctx.globalAlpha = 0.95;
       ctx.fill();
-      ctx.restore();
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      ctx.fillStyle = "#22d3ee";
+      ctx.font = "bold 9px monospace";
+      ctx.textAlign = "center";
+      ctx.fillText("ESP32 RX (0.0m)", cx, cy + 19);
 
       // 5. Rotating Radar Sweep Beam & Phosphor Trailing Glow
-      const trailAngle = Math.PI / 3.5; // 50 degrees trail
+      const trailAngle = Math.PI / 3.5;
       const numSlices = 24;
       for (let s = 0; s < numSlices; s++) {
         const sliceStart = sweepAngle - (trailAngle / numSlices) * (s + 1);
@@ -362,7 +540,7 @@ export function UavTacticalRadar({
         ctx.moveTo(cx, cy);
         ctx.arc(cx, cy, radius, sliceStart, sliceEnd);
         ctx.closePath();
-        ctx.fillStyle = "#06b6d4"; // Cyan radar sweep
+        ctx.fillStyle = "#06b6d4";
         ctx.globalAlpha = alpha;
         ctx.fill();
       }
@@ -392,17 +570,15 @@ export function UavTacticalRadar({
         // Ping detection trigger when sweep line crosses the blip
         if (angleDiff < 0.12 && now - lastBeepTimeRef.current > 400) {
           lastBeepTimeRef.current = now;
-          setLastPingTime(now);
           playRadarBeep(blip.type === "hostile" ? 920 : 640);
         }
 
-        // Blip Fade calculation (Call of Duty UAV Ping Persistence)
         const timeSincePing = (now - blip.lastPingedAt) / 1000;
         const persistSec = uavMode === "advanced" ? 1.0 : sweepDurationSec * 1.2;
         let fadeAlpha = Math.max(0.15, 1.0 - timeSincePing / persistSec);
 
         if (uavMode === "advanced") {
-          fadeAlpha = 0.95; // Always crisp in Advanced UAV orbital mode
+          fadeAlpha = 0.95;
         }
 
         // Outer radar pulse shockwave ring
@@ -417,7 +593,7 @@ export function UavTacticalRadar({
         // Core Solid Blip Dot
         ctx.beginPath();
         ctx.arc(bx, by, blip.type === "hostile" ? 6 : 5, 0, Math.PI * 2);
-        ctx.fillStyle = blip.type === "hostile" ? "#ef4444" : "#10b981"; // Red = Hostile/Unknown, Green = Friendly
+        ctx.fillStyle = blip.type === "hostile" ? "#ef4444" : "#10b981";
         ctx.globalAlpha = fadeAlpha;
         ctx.fill();
 
@@ -426,9 +602,10 @@ export function UavTacticalRadar({
         ctx.stroke();
 
         // Velocity Direction Vector (Advanced UAV Mode)
-        if (uavMode === "advanced" && Math.abs(blip.velocityMs) > 0.1) {
-          const arrowLen = Math.min(24, Math.abs(blip.velocityMs) * 18);
-          const arrowAngle = blip.angleDeg * (Math.PI / 180) + (blip.velocityMs > 0 ? 0 : Math.PI);
+        if (uavMode === "advanced" && Math.abs(blip.velocityMs) > 0.08) {
+          const arrowLen = Math.min(24, Math.abs(blip.velocityMs) * 20);
+          const arrowAngle =
+            -blip.angleDeg * (Math.PI / 180) + (blip.velocityMs > 0 ? 0 : Math.PI);
           ctx.beginPath();
           ctx.moveTo(bx, by);
           ctx.lineTo(bx + Math.cos(arrowAngle) * arrowLen, by + Math.sin(arrowAngle) * arrowLen);
@@ -441,16 +618,20 @@ export function UavTacticalRadar({
         // Blip Metadata Box
         ctx.fillStyle = blip.type === "hostile" ? "#fca5a5" : "#6ee7b7";
         ctx.font = "bold 9px monospace";
-        ctx.globalAlpha = fadeAlpha * 0.9;
+        ctx.globalAlpha = fadeAlpha * 0.95;
         ctx.textAlign = "left";
         ctx.fillText(
-          `${blip.type === "hostile" ? "TARGET [RF]" : "PHONE [GPS]"} ${blip.rangeMeters}m`,
+          `${blip.type === "hostile" ? "MOTION [RF]" : "PHONE [IMU]"} ${blip.rangeMeters}m`,
           bx + 10,
           by - 4
         );
         ctx.font = "8px monospace";
         ctx.fillStyle = "#94a3b8";
-        ctx.fillText(`v: ${blip.velocityMs > 0 ? "+" : ""}${blip.velocityMs} m/s`, bx + 10, by + 8);
+        ctx.fillText(
+          `v: ${blip.velocityMs}m/s | conf: ${Math.round(blip.confidence * 100)}%`,
+          bx + 10,
+          by + 8
+        );
       });
 
       // 7. Outer Compass Ring Border
@@ -470,14 +651,16 @@ export function UavTacticalRadar({
 
   // Current active sector calculation
   useEffect(() => {
-    if (wifiVariance > 2.5) {
-      setActiveSector("FRESNEL CORE (ROOM CENTER)");
-    } else if (csiVariance > 1.2) {
-      setActiveSector("SECTOR B (PROXIMITY DESK)");
-    } else {
+    if (!isMotionDetected) {
       setActiveSector("STATIC / PERIMETER CLEAR");
+    } else if (wifiVariance > 1.8) {
+      setActiveSector(`FRESNEL CORE (~${(activeRouterDist * 0.48).toFixed(1)}m)`);
+    } else if (csiVariance > 1.1) {
+      setActiveSector(`NEAR-FIELD DESK (~${(activeRouterDist * 0.28).toFixed(1)}m)`);
+    } else {
+      setActiveSector(`OUTER FRESNEL (~${(activeRouterDist * 0.62).toFixed(1)}m)`);
     }
-  }, [wifiVariance, csiVariance]);
+  }, [isMotionDetected, wifiVariance, csiVariance, activeRouterDist]);
 
   return (
     <div className="bg-slate-950 border border-slate-800 rounded-2xl p-5 flex flex-col gap-4 shadow-2xl relative overflow-hidden">
@@ -488,19 +671,22 @@ export function UavTacticalRadar({
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800/80 pb-3 relative z-10">
         <div className="flex items-center gap-2.5">
           <div className="w-8 h-8 rounded-lg bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center text-cyan-400">
-            <Radar className="w-5 h-5 animate-spin" style={{ animationDuration: `${sweepDurationSec}s` }} />
+            <Radar
+              className="w-5 h-5 animate-spin"
+              style={{ animationDuration: `${sweepDurationSec}s` }}
+            />
           </div>
           <div>
             <div className="flex items-center gap-2">
               <h2 className="text-sm font-black tracking-wider uppercase text-cyan-300 font-mono">
-                TACTICAL UAV RADAR // RF DOPPLER SWEEP
+                TACTICAL UAV RADAR // FRESNEL RF PINPOINTER
               </h2>
               <span className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-cyan-500/20 text-cyan-300 border border-cyan-500/40">
-                {uavMode === "advanced" ? "ADVANCED UAV (VSAT)" : "STANDARD UAV (3s PING)"}
+                {uavMode === "advanced" ? "ORBITAL VSAT (REALTIME)" : "PULSE SWEEP (COD UAV)"}
               </span>
             </div>
             <p className="text-[11px] text-slate-400 font-mono mt-0.5">
-              Multipath Fresnel Doppler Pinpointer &bull; Zero Cameras &bull; Call of Duty Minimap Sweep
+              1st Fresnel Zone Radius r₁ = {fresnelRadiusMeters}m &bull; Log-Distance Path Loss (A={refRssi1m}dBm, n={pathLossExp})
             </p>
           </div>
         </div>
@@ -509,7 +695,7 @@ export function UavTacticalRadar({
         <div className="flex items-center gap-2">
           <button
             onClick={() => setUavMode(uavMode === "standard" ? "advanced" : "standard")}
-            className={`px-2.5 py-1.5 rounded-lg text-xs font-mono font-bold border transition-all flex items-center gap-1.5 ${
+            className={`px-2.5 py-1.5 rounded-lg text-xs font-mono font-bold border transition-all flex items-center gap-1.5 cursor-pointer ${
               uavMode === "advanced"
                 ? "bg-purple-500/20 text-purple-300 border-purple-500/50 shadow-lg shadow-purple-500/10"
                 : "bg-slate-900 text-slate-400 border-slate-700 hover:text-slate-200"
@@ -521,7 +707,7 @@ export function UavTacticalRadar({
 
           <button
             onClick={() => setRadarMuted(!radarMuted)}
-            className={`p-1.5 rounded-lg border text-xs font-mono transition-all ${
+            className={`p-1.5 rounded-lg border text-xs font-mono transition-all cursor-pointer ${
               radarMuted
                 ? "bg-slate-900 text-slate-500 border-slate-800"
                 : "bg-cyan-500/20 text-cyan-300 border-cyan-500/40"
@@ -547,12 +733,12 @@ export function UavTacticalRadar({
           {/* Quick Range / Sweep Selector Overlay */}
           <div className="flex items-center justify-between w-full px-4 pt-3 text-[11px] font-mono text-slate-400">
             <div className="flex items-center gap-1">
-              <span>RANGE:</span>
-              {[3, 5, 8].map((r) => (
+              <span>MAX SCALE:</span>
+              {[4, 8, 12].map((r) => (
                 <button
                   key={r}
                   onClick={() => setMaxRangeMeters(r)}
-                  className={`px-1.5 py-0.5 rounded ${
+                  className={`px-1.5 py-0.5 rounded cursor-pointer ${
                     maxRangeMeters === r
                       ? "bg-cyan-500/30 text-cyan-200 font-bold border border-cyan-500/50"
                       : "hover:text-slate-200"
@@ -569,7 +755,7 @@ export function UavTacticalRadar({
                 <button
                   key={s}
                   onClick={() => setSweepDurationSec(s)}
-                  className={`px-1.5 py-0.5 rounded ${
+                  className={`px-1.5 py-0.5 rounded cursor-pointer ${
                     sweepDurationSec === s
                       ? "bg-purple-500/30 text-purple-200 font-bold border border-purple-500/50"
                       : "hover:text-slate-200"
@@ -591,29 +777,78 @@ export function UavTacticalRadar({
                 <Wifi className="w-3.5 h-3.5 text-purple-400" />
                 Physical Node Geometry
               </span>
-              <span className="px-1.5 py-0.2 rounded text-[10px] bg-purple-500/20 text-purple-300 border border-purple-500/40">
-                {autoRssiDistance ? "AUTO-RSSI ESTIMATION" : "MANUAL ALIGNMENT"}
-              </span>
+              <button
+                onClick={() => setShowPathLossTuning(!showPathLossTuning)}
+                className="px-1.5 py-0.5 rounded text-[10px] bg-purple-500/20 hover:bg-purple-500/30 text-purple-300 border border-purple-500/40 flex items-center gap-1 cursor-pointer"
+                title="Tune Path Loss Model Constants"
+              >
+                <Sliders className="w-2.5 h-2.5" />
+                <span>{showPathLossTuning ? "HIDE CAL" : "TUNE RF"}</span>
+              </button>
             </div>
 
             {/* Router Distance & RSSI Reading */}
             <div className="grid grid-cols-2 gap-2 text-center text-[11px]">
               <div className="bg-slate-950 p-2 rounded-lg border border-slate-800">
                 <span className="text-[9px] text-slate-500 block uppercase">Router Distance</span>
-                <span className="text-purple-300 font-bold text-sm">{activeRouterDist} meters</span>
+                <span className="text-purple-300 font-bold text-sm">{activeRouterDist.toFixed(2)} m</span>
               </div>
               <div className="bg-slate-950 p-2 rounded-lg border border-slate-800">
                 <span className="text-[9px] text-slate-500 block uppercase">Link RSSI</span>
-                <span className="text-cyan-300 font-bold text-sm">{wifiRssi} dBm</span>
+                <span className="text-cyan-300 font-bold text-sm">{wifiRssi.toFixed(1)} dBm</span>
               </div>
             </div>
+
+            {/* Optional Path Loss Fine-Tuning Sliders */}
+            {showPathLossTuning && (
+              <div className="p-2.5 rounded-lg bg-slate-950 border border-purple-500/30 space-y-2 text-[10px]">
+                <div className="flex items-center justify-between text-purple-300 font-bold">
+                  <span>1m Ref RSSI (A):</span>
+                  <span>{refRssi1m} dBm</span>
+                </div>
+                <input
+                  type="range"
+                  min="-52"
+                  max="-32"
+                  step="1"
+                  value={refRssi1m}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    setRefRssi1m(v);
+                    try {
+                      localStorage.setItem("uav_ref_rssi_1m", String(v));
+                    } catch {}
+                  }}
+                  className="w-full accent-purple-500"
+                />
+                <div className="flex items-center justify-between text-cyan-300 font-bold">
+                  <span>Wall Path Loss (n):</span>
+                  <span>{pathLossExp.toFixed(1)}</span>
+                </div>
+                <input
+                  type="range"
+                  min="1.8"
+                  max="3.6"
+                  step="0.1"
+                  value={pathLossExp}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    setPathLossExp(v);
+                    try {
+                      localStorage.setItem("uav_path_loss_n", String(v));
+                    } catch {}
+                  }}
+                  className="w-full accent-cyan-500"
+                />
+              </div>
+            )}
 
             {/* Bearing / Direction of Router relative to Laptop */}
             <div className="space-y-1">
               <div className="flex items-center justify-between text-[10px] text-slate-400">
                 <span className="flex items-center gap-1">
                   <Compass className="w-3 h-3 text-cyan-400" />
-                  Router Direction Relative to Desk:
+                  Router Direction from ESP32:
                 </span>
                 <span className="text-slate-200 font-bold">{routerBearingDeg}°</span>
               </div>
@@ -626,7 +861,7 @@ export function UavTacticalRadar({
                 ].map((b) => (
                   <button
                     key={b.deg}
-                    onClick={() => setRouterBearingDeg(b.deg)}
+                    onClick={() => handleBearingChange(b.deg)}
                     className={`py-1 px-1 rounded border text-center transition-all cursor-pointer ${
                       routerBearingDeg === b.deg
                         ? "bg-purple-600 text-white border-purple-400 font-bold shadow-sm"
@@ -641,31 +876,43 @@ export function UavTacticalRadar({
 
             {/* Auto vs Manual Distance Toggle */}
             <div className="flex items-center justify-between text-[10px] text-slate-400 pt-1 border-t border-slate-800">
-              <span>Auto RSSI Range:</span>
+              <span>Distance Mode:</span>
               <button
-                onClick={() => setAutoRssiDistance(!autoRssiDistance)}
-                className={`px-2 py-0.5 rounded text-[10px] font-bold border transition-all ${
+                onClick={() => {
+                  const next = !autoRssiDistance;
+                  setAutoRssiDistance(next);
+                  try {
+                    localStorage.setItem("uav_auto_rssi_dist", String(next));
+                  } catch {}
+                }}
+                className={`px-2 py-0.5 rounded text-[10px] font-bold border transition-all cursor-pointer ${
                   autoRssiDistance
                     ? "bg-cyan-500/20 text-cyan-300 border-cyan-500/40"
-                    : "bg-slate-950 text-slate-500 border-slate-800"
+                    : "bg-slate-950 text-slate-400 border-slate-800"
                 }`}
               >
-                {autoRssiDistance ? "ENABLED (Auto)" : "MANUAL (Custom)"}
+                {autoRssiDistance ? "AUTO PATH-LOSS" : "MANUAL LOCK"}
               </button>
             </div>
             {!autoRssiDistance && (
               <div className="flex items-center gap-2 text-[10px]">
-                <span>Distance:</span>
+                <span>Exact Dist:</span>
                 <input
                   type="range"
                   min="1"
-                  max="10"
-                  step="0.5"
+                  max="12"
+                  step="0.2"
                   value={routerDistanceMeters}
-                  onChange={(e) => setRouterDistanceMeters(parseFloat(e.target.value))}
+                  onChange={(e) => {
+                    const v = parseFloat(e.target.value);
+                    setRouterDistanceMeters(v);
+                    try {
+                      localStorage.setItem("uav_manual_dist", String(v));
+                    } catch {}
+                  }}
                   className="w-full accent-purple-500"
                 />
-                <span className="w-8 text-right font-bold text-slate-200">{routerDistanceMeters}m</span>
+                <span className="w-10 text-right font-bold text-slate-200">{routerDistanceMeters}m</span>
               </div>
             )}
           </div>
@@ -696,7 +943,7 @@ export function UavTacticalRadar({
             </div>
 
             <p className="text-[11px] font-mono text-slate-400">
-              Sector: <strong className="text-cyan-300">{activeSector}</strong>
+              Zone: <strong className="text-cyan-300">{activeSector}</strong>
             </p>
           </div>
 
@@ -708,7 +955,7 @@ export function UavTacticalRadar({
                 Doppler Multipath Shift
               </span>
               <span className="text-[10px] font-mono text-purple-300">
-                {csiVariance > 1.0 ? "DYNAMIC" : "QUIET"}
+                {csiVariance > 0.9 ? "DYNAMIC" : "QUIET"}
               </span>
             </div>
 
@@ -723,7 +970,7 @@ export function UavTacticalRadar({
               />
             </div>
             <p className="text-[10px] font-mono text-slate-400">
-              Doppler shifts proportional to chest and gait locomotion.
+              CSI Phase Decorrelation: <strong className="text-purple-200">{decorrelationSpread.toFixed(2)} σ²Δ</strong>
             </p>
           </div>
 
@@ -753,9 +1000,9 @@ export function UavTacticalRadar({
           <div className="p-3 rounded-xl bg-purple-950/20 border border-purple-800/40 text-[10px] font-mono text-purple-200/90 leading-relaxed">
             <div className="font-bold flex items-center gap-1 text-purple-300 mb-1">
               <Navigation className="w-3 h-3" />
-              HOW THE UAV PINPOINTS TARGETS:
+              FRESNEL ZONE DIFFRACTION MODEL:
             </div>
-            The Router (Tx) and ESP32 (Rx) form a 1st Fresnel zone ellipse. When a person moves, 2.4 GHz waves reflect off their body (wavelength &lambda; = 12.5 cm), causing cyclic Doppler constructive/destructive fades. The radar sweep periodically calculates radial distance from subcarrier phase slopes and plots blips with tactical decay!
+            The Router (Tx) and ESP32 (Rx) form a 1st Fresnel zone ellipse (r₁ = {fresnelRadiusMeters}m). Deep RSSI shadowing pinpoints bodies crossing the direct Line-of-Sight midpoint, while high CSI subcarrier variance with stable RSSI isolates near-field desk movements.
           </div>
         </div>
       </div>

@@ -56,18 +56,21 @@ export default function WifiMotionLab() {
   const [isQrModalOpen, setIsQrModalOpen] = useState<boolean>(false);
 
   // Physical Sensing Telemetry (Actual measured physics)
-  const [wifiRssi, setWifiRssi] = useState<number>(-52);
-  const [wifiVariance, setWifiVariance] = useState<number>(0.8);
-  const [csiVariance, setCsiVariance] = useState<number>(0.4);
+  const [wifiRssi, setWifiRssi] = useState<number>(-60.0);
+  const [slowRssi, setSlowRssi] = useState<number>(-60.0);
+  const [wifiVariance, setWifiVariance] = useState<number>(0.12);
+  const [noiseFloor, setNoiseFloor] = useState<number>(0.18);
+  const [csiVariance, setCsiVariance] = useState<number>(0.25);
+  const [hwDecorrelation, setHwDecorrelation] = useState<number>(0.0);
   const [triggerCount, setTriggerCount] = useState<number>(0);
   const [isRfMoving, setIsRfMoving] = useState<boolean>(false);
   const [subcarrierAmplitudes, setSubcarrierAmplitudes] = useState<number[]>(
-    new Array(64).fill(12)
+    new Array(64).fill(16)
   );
 
-  // Calibration State
-  const [baselineVariance, setBaselineVariance] = useState<number>(1.2);
-  const [triggerThreshold, setTriggerThreshold] = useState<number>(2.8);
+  // Calibration State (Calibrated for real 2.4 GHz residential multipath: quiet ~0.08-0.25 dB², motion >0.65 dB²)
+  const [baselineVariance, setBaselineVariance] = useState<number>(0.18);
+  const [triggerThreshold, setTriggerThreshold] = useState<number>(0.68);
   const [isCalibrating, setIsCalibrating] = useState<boolean>(false);
   const [calibrationProgress, setCalibrationProgress] = useState<number>(0);
 
@@ -89,15 +92,16 @@ export default function WifiMotionLab() {
   const [events, setEvents] = useState<MotionEvent[]>([]);
   const [terminalLogs, setTerminalLogs] = useState<string[]>([
     "[SYSTEM] Zero-Cost Wi-Fi Motion Sensing Lab Active",
-    "[NETWORK] Target Wi-Fi SSID: Herman (Home Router)",
-    "[HARDWARE] ESP32-D0WD-V3 connected on COM3 & local network",
-    "[AUTO-SYNC] Polling ESP32 telemetry automatically over Wi-Fi...",
+    "[NETWORK] Target Wi-Fi AP: Channel 8 (2.4 GHz Multipath Corridor)",
+    "[HARDWARE] ESP32 Promiscuous & 64-OFDM CSI Sniffer Ready",
+    "[AUTO-SYNC] Polling ESP32 telemetry @ 10 Hz...",
   ]);
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const portRef = useRef<any>(null);
   const readerRef = useRef<ReadableStreamDefaultReader<string> | null>(null);
   const terminalEndRef = useRef<HTMLDivElement>(null);
+  const lastEventTimeRef = useRef<number>(0);
 
   // Web Audio Synth
   const playChime = (freq: number = 880) => {
@@ -129,53 +133,54 @@ export default function WifiMotionLab() {
     setSerialSupported("serial" in navigator);
   }, []);
 
-  // 1. AUTO-SYNC: Polls ESP32 Telemetry Automatically over Wi-Fi (Zero manual clicking!)
+  // 1. AUTO-SYNC: Polls ESP32 Telemetry Automatically at 10 Hz (every 100ms)
   useEffect(() => {
     let failureCount = 0;
     const pollInterval = setInterval(async () => {
       try {
-        const res = await fetch("/api/esp32");
+        const res = await fetch("/api/esp32", { cache: "no-store" });
         if (res.ok) {
           const data = await res.json();
-          if (data.connected || data.source === "auto_push" || data.timestamp > 0) {
+          if (data.connected && data.source !== "stale_cache") {
             failureCount = 0;
             setAutoSyncConnected(true);
             if (data.ip) setEsp32Ip(data.ip);
-            if (data.rssi !== undefined && data.rssi !== 0) setWifiRssi(data.rssi);
-            if (data.variance !== undefined) setWifiVariance(data.variance);
-            if (data.csiVariance !== undefined) setCsiVariance(data.csiVariance);
-            if (data.motion !== undefined) setIsRfMoving(data.motion);
-            if (data.triggerCount !== undefined) setTriggerCount(data.triggerCount);
+            if (data.rssi !== undefined && data.rssi !== 0) setWifiRssi(Number(data.rssi));
+            if (data.slowRssi !== undefined && data.slowRssi !== 0) setSlowRssi(Number(data.slowRssi));
+            if (data.variance !== undefined) setWifiVariance(Number(data.variance));
+            if (data.noiseFloor !== undefined) setNoiseFloor(Number(data.noiseFloor));
+            if (data.csiVariance !== undefined) setCsiVariance(Number(data.csiVariance));
+            if (data.decorrelation !== undefined) setHwDecorrelation(Number(data.decorrelation));
+            if (data.motion !== undefined) setIsRfMoving(Boolean(data.motion));
+            if (data.triggerCount !== undefined) setTriggerCount(Number(data.triggerCount));
 
-            // Synthesize or map 64 subcarriers from measured CSI variance
             if (Array.isArray(data.subcarriers) && data.subcarriers.length === 64) {
               setSubcarrierAmplitudes(data.subcarriers);
-            } else {
-              setSubcarrierAmplitudes((prev) =>
-                prev.map((val, idx) => {
-                  const subNoise = Math.sin(Date.now() / 300 + idx * 0.4) * (data.csiVariance || 0.4);
-                  return Math.max(2, Math.min(30, 14 + subNoise * 4));
-                })
-              );
+            }
+          } else {
+            // Hardware disconnected or stale cache (>3.5s without packet)
+            setAutoSyncConnected(false);
+            if (!isSerialConnected) {
+              setIsRfMoving(false);
             }
           }
         }
       } catch {
         failureCount++;
-        if (failureCount > 8) {
+        if (failureCount > 5) {
           setAutoSyncConnected(false);
         }
       }
-    }, 200);
+    }, 100);
 
     return () => clearInterval(pollInterval);
-  }, []);
+  }, [isSerialConnected]);
 
   // 2. Poll Phone Ground Truth Telemetry (/api/phone-telemetry)
   useEffect(() => {
     const phoneInterval = setInterval(async () => {
       try {
-        const res = await fetch("/api/phone-telemetry");
+        const res = await fetch("/api/phone-telemetry", { cache: "no-store" });
         if (res.ok) {
           const data = await res.json();
           if (data.connected) {
@@ -209,30 +214,28 @@ export default function WifiMotionLab() {
   useEffect(() => {
     const interval = setInterval(() => {
       const now = Date.now();
-      const rfTripped = autoSyncConnected ? isRfMoving : (wifiVariance > triggerThreshold);
-      if (!autoSyncConnected) {
-        setIsRfMoving(rfTripped);
-      }
+      // Unified motion decision: trigger if either hardware flag OR frontend calibrated threshold is exceeded
+      const thresholdExceeded =
+        wifiVariance >= triggerThreshold || csiVariance >= Math.max(1.1, triggerThreshold * 1.4);
+      const rfTripped =
+        (autoSyncConnected || isSerialConnected) && (isRfMoving || thresholdExceeded);
 
       if (rfTripped) {
-        setEvents((prev) => {
-          const last = prev[0];
-          if (!last || now - new Date(last.timestamp).getTime() > 3000) {
-            playChime(660);
-            return [
-              {
-                id: `evt-${now}`,
-                timestamp: new Date().toLocaleTimeString(),
-                type: "motion_detected",
-                message: `Motion Detected! RF Var: ${wifiVariance.toFixed(1)} dB² | CSI Var: ${csiVariance.toFixed(2)}`,
-                wifiVariance,
-                csiVariance,
-              },
-              ...prev.slice(0, 40),
-            ];
-          }
-          return prev;
-        });
+        if (now - lastEventTimeRef.current > 3000) {
+          lastEventTimeRef.current = now;
+          playChime(660);
+          setEvents((prev) => [
+            {
+              id: `evt-${now}`,
+              timestamp: new Date().toLocaleTimeString(),
+              type: "motion_detected",
+              message: `Motion Detected! RF Var: ${wifiVariance.toFixed(2)} dB² | CSI Var: ${csiVariance.toFixed(2)}`,
+              wifiVariance,
+              csiVariance,
+            },
+            ...prev.slice(0, 40),
+          ]);
+        }
       }
 
       // Append to oscilloscope history
@@ -251,6 +254,9 @@ export default function WifiMotionLab() {
 
     return () => clearInterval(interval);
   }, [
+    autoSyncConnected,
+    isSerialConnected,
+    isRfMoving,
     wifiRssi,
     wifiVariance,
     csiVariance,
@@ -299,15 +305,34 @@ export default function WifiMotionLab() {
             const trimmed = line.trim();
             if (!trimmed) continue;
 
-            // Parse formatted telemetry:
-            // [TELEMETRY] State: MOTION | Ambient Var: 157.00 dB² | CSI Var: 2.07 | Connected Phones: 0 | Phone Var: 0.00 dB² | Triggers: 1
-            const ambMatch = trimmed.match(/Ambient\s*Var:\s*([\d\.]+)/i);
-            const csiMatch = trimmed.match(/CSI\s*Var:\s*([\d\.]+)/i);
-            const trigMatch = trimmed.match(/Triggers:\s*(\d+)/i);
+            // 1. Parse JSON telemetry stream from ESP32 firmware
+            if (trimmed.startsWith("{")) {
+              try {
+                const parsed = JSON.parse(trimmed);
+                if (parsed.rssi !== undefined) setWifiRssi(Number(parsed.rssi));
+                if (parsed.slowRssi !== undefined) setSlowRssi(Number(parsed.slowRssi));
+                if (parsed.variance !== undefined) setWifiVariance(Number(parsed.variance));
+                if (parsed.noiseFloor !== undefined) setNoiseFloor(Number(parsed.noiseFloor));
+                if (parsed.csiVariance !== undefined) setCsiVariance(Number(parsed.csiVariance));
+                if (parsed.decorrelation !== undefined) setHwDecorrelation(Number(parsed.decorrelation));
+                if (parsed.motion !== undefined) setIsRfMoving(Boolean(parsed.motion));
+                if (parsed.triggers !== undefined) setTriggerCount(Number(parsed.triggers));
+                if (Array.isArray(parsed.subcarriers) && parsed.subcarriers.length === 64) {
+                  setSubcarrierAmplitudes(parsed.subcarriers);
+                }
+              } catch {
+                // Ignore partial JSON lines
+              }
+            } else {
+              // 2. Fallback regex for legacy formatted text logs
+              const ambMatch = trimmed.match(/Ambient\s*Var:\s*([\d\.]+)/i);
+              const csiMatch = trimmed.match(/CSI\s*Var:\s*([\d\.]+)/i);
+              const trigMatch = trimmed.match(/Triggers:\s*(\d+)/i);
 
-            if (ambMatch) setWifiVariance(parseFloat(ambMatch[1]));
-            if (csiMatch) setCsiVariance(parseFloat(csiMatch[1]));
-            if (trigMatch) setTriggerCount(parseInt(trigMatch[1], 10));
+              if (ambMatch) setWifiVariance(parseFloat(ambMatch[1]));
+              if (csiMatch) setCsiVariance(parseFloat(csiMatch[1]));
+              if (trigMatch) setTriggerCount(parseInt(trigMatch[1], 10));
+            }
 
             setTerminalLogs((prev) => [...prev.slice(-80), trimmed]);
           }
@@ -338,14 +363,19 @@ export default function WifiMotionLab() {
     }
   };
 
-  // Sensitivity adjustment handler
+  // Sensitivity adjustment handler (Calibrated to residential 2.4 GHz multipath)
   const handleSetSensitivity = (level: "low" | "normal" | "high") => {
     setSensitivity(level);
-    let mult = 2.0;
-    let offset = 0.8;
-    if (level === "low") { mult = 2.6; offset = 1.2; }
-    else if (level === "high") { mult = 1.4; offset = 0.4; }
-    setTriggerThreshold(parseFloat((baselineVariance * mult + offset).toFixed(2)));
+    let mult = 2.2;
+    let offset = 0.28;
+    if (level === "low") {
+      mult = 3.0;
+      offset = 0.55;
+    } else if (level === "high") {
+      mult = 1.5;
+      offset = 0.14;
+    }
+    setTriggerThreshold(parseFloat(Math.max(0.32, baselineVariance * mult + offset).toFixed(2)));
   };
 
   // Calibration Protocol
@@ -365,14 +395,19 @@ export default function WifiMotionLab() {
         clearInterval(calInterval);
         setIsCalibrating(false);
         const mean = samples.reduce((a, b) => a + b, 0) / samples.length;
-        const newBaseline = parseFloat(mean.toFixed(2));
+        const newBaseline = parseFloat(Math.max(0.08, mean).toFixed(2));
 
-        let mult = 2.0;
-        let offset = 0.8;
-        if (sensitivity === "low") { mult = 2.6; offset = 1.2; }
-        else if (sensitivity === "high") { mult = 1.4; offset = 0.4; }
+        let mult = 2.2;
+        let offset = 0.28;
+        if (sensitivity === "low") {
+          mult = 3.0;
+          offset = 0.55;
+        } else if (sensitivity === "high") {
+          mult = 1.5;
+          offset = 0.14;
+        }
 
-        const newThreshold = parseFloat((newBaseline * mult + offset).toFixed(2));
+        const newThreshold = parseFloat(Math.max(0.32, newBaseline * mult + offset).toFixed(2));
 
         setBaselineVariance(newBaseline);
         setTriggerThreshold(newThreshold);
@@ -393,9 +428,18 @@ export default function WifiMotionLab() {
     }, 200);
   };
 
+  // Unified Motion Decision across all views
+  const isMotionActive =
+    (autoSyncConnected || isSerialConnected) &&
+    (isRfMoving ||
+      wifiVariance >= triggerThreshold ||
+      csiVariance >= Math.max(1.1, triggerThreshold * 1.4));
+
   // Real-Time Multi-Sensor Fusion Engine
   // 1. Wi-Fi RF component (from ESP32)
-  const rfConfidence = Math.min(100, Math.round((wifiVariance / Math.max(1, triggerThreshold)) * 80));
+  const rfConfidence = (autoSyncConnected || isSerialConnected)
+    ? Math.min(100, Math.round((wifiVariance / Math.max(0.25, triggerThreshold)) * 75))
+    : 0;
   // 2. Phone inertial component (from Gyroscope + Accelerometer with explicit permission)
   const phoneMotionDetected = phoneConnected && (phoneGyroMag > 0.4 || phoneAccelMag > 1.2);
   // 3. Fused Cross-Verification Confidence
@@ -404,54 +448,56 @@ export default function WifiMotionLab() {
     : rfConfidence;
 
   // --- REAL-TIME MULTI-OCCUPANCY & CROWD MATH ENGINE ---
-  // A. 64-Subcarrier Pairwise Phase Decorrelation Spread (σ²Δ)
-  // Single moving body: adjacent subcarriers shift in-phase (low diff spread).
-  // Multiple moving bodies: destructive spatial interference notches produce high adjacent diff spread!
+  // A. Active 64-Subcarrier Pairwise Phase Decorrelation Spread (σ²Δ)
+  // Excludes null guard bands (0..5, 59..63) and DC carrier (32)
+  // Quiet room: < 0.8 | Single moving body: 0.8 <= σ²Δ < 2.5 | Multi-person: >= 2.5
   const decorrelationSpread = useMemo(() => {
-    if (!subcarrierAmplitudes || subcarrierAmplitudes.length < 2) return 0;
+    if (hwDecorrelation > 0) return hwDecorrelation;
+    if (!subcarrierAmplitudes || subcarrierAmplitudes.length < 64) return 0;
     const diffs: number[] = [];
-    for (let i = 0; i < subcarrierAmplitudes.length - 1; i++) {
+    for (let i = 6; i < 58; i++) {
+      if (i === 31 || i === 32) continue; // Skip DC null boundary
       diffs.push(Math.abs(subcarrierAmplitudes[i + 1] - subcarrierAmplitudes[i]));
     }
+    if (diffs.length === 0) return 0;
     const meanDiff = diffs.reduce((a, b) => a + b, 0) / diffs.length;
     const varDiff = diffs.reduce((a, b) => a + (b - meanDiff) ** 2, 0) / diffs.length;
     return parseFloat(varDiff.toFixed(2));
-  }, [subcarrierAmplitudes]);
-
-  const isMotionActive = autoSyncConnected ? isRfMoving : (wifiVariance > triggerThreshold);
+  }, [hwDecorrelation, subcarrierAmplitudes]);
 
   // B. Instantaneous Multi-Person Probability Score (0% to 100%)
   const multiPersonProb = useMemo(() => {
-    if (!isMotionActive) return 0;
-    const decorrScore = Math.min(100, Math.max(0, ((decorrelationSpread - 10.0) / 16.0) * 100));
-    const csiScore = Math.min(100, Math.max(0, ((csiVariance - 2.0) / 3.5) * 100));
-    const rfEnergyScore = Math.min(100, Math.max(0, ((wifiVariance - triggerThreshold) / 10.0) * 100));
-    return Math.min(100, Math.max(0, Math.round(decorrScore * 0.45 + csiScore * 0.35 + rfEnergyScore * 0.20)));
+    if (!isMotionActive && decorrelationSpread < 0.8) return 0;
+    const decorrScore = Math.min(100, Math.max(0, ((decorrelationSpread - 0.8) / (2.5 - 0.8)) * 100));
+    const csiScore = Math.min(100, Math.max(0, ((csiVariance - 0.8) / 2.2) * 100));
+    const rfEnergyScore = Math.min(100, Math.max(0, ((wifiVariance - triggerThreshold) / 2.5) * 100));
+    return Math.min(100, Math.max(0, Math.round(decorrScore * 0.55 + csiScore * 0.30 + rfEnergyScore * 0.15)));
   }, [isMotionActive, decorrelationSpread, csiVariance, wifiVariance, triggerThreshold]);
 
-  // C. Instantaneous Occupancy Classification
+  // C. Instantaneous Occupancy Classification (Matches AGENTS.md: <0.8 EMPTY, 0.8..2.5 SINGLE, >=2.5 MULTI)
   const occupancyState: "EMPTY" | "SINGLE" | "MULTI" = useMemo(() => {
-    if (!isMotionActive) return "EMPTY";
-    if (multiPersonProb >= 50) return "MULTI";
+    if (!isMotionActive && decorrelationSpread < 0.8) return "EMPTY";
+    if (decorrelationSpread >= 2.5 || multiPersonProb >= 55) return "MULTI";
     return "SINGLE";
-  }, [isMotionActive, multiPersonProb]);
+  }, [isMotionActive, decorrelationSpread, multiPersonProb]);
 
-  // D. Leaky Bucket Integrator Loop (Runs at 5 Hz = every 200ms)
+  // D. Exact Leaky Bucket CUSUM Integrator: S_t = max(0, S_{t-1} + (variance - baseline) - leakRate)
   useEffect(() => {
     const bucketInterval = setInterval(() => {
       setLeakyBucketLevel((prev) => {
-        if (occupancyState === "MULTI") {
-          return Math.min(100, prev + 2.5);
-        } else if (occupancyState === "SINGLE") {
-          return Math.max(0, prev - 1.2);
-        } else {
-          return Math.max(0, prev - 2.5);
+        if (!autoSyncConnected && !isSerialConnected) {
+          return Math.max(0, prev - 3.0);
         }
+        const activeBaseline = Math.max(0.12, noiseFloor || baselineVariance);
+        const leakRate = occupancyState === "MULTI" ? 0.15 : 0.45;
+        const multiFactor = occupancyState === "MULTI" ? 3.2 : occupancyState === "SINGLE" ? 0.6 : -1.2;
+        const delta = (wifiVariance - activeBaseline) * multiFactor - leakRate;
+        return parseFloat(Math.min(100, Math.max(0, prev + delta)).toFixed(1));
       });
     }, 200);
 
     return () => clearInterval(bucketInterval);
-  }, [occupancyState]);
+  }, [autoSyncConnected, isSerialConnected, wifiVariance, noiseFloor, baselineVariance, occupancyState]);
 
   return (
     <div className="min-h-screen bg-[#04060b] text-slate-100 p-3 md:p-6 flex flex-col font-sans select-none">
@@ -568,9 +614,9 @@ export default function WifiMotionLab() {
       {dashboardMode === "simple" ? (
         <main className="my-6 flex-1 flex flex-col justify-center">
           <SimpleMotionView
-            connected={autoSyncConnected}
-            isMoving={isRfMoving}
-            rssi={wifiRssi}
+            connected={autoSyncConnected || isSerialConnected}
+            isMoving={isMotionActive}
+            rssi={Number(wifiRssi.toFixed(1))}
             variance={wifiVariance}
             csiVariance={csiVariance}
             triggerCount={triggerCount}
@@ -597,7 +643,7 @@ export default function WifiMotionLab() {
         {/* Card 1: Ambient Wi-Fi RF Multipath */}
         <div
           className={`p-4 rounded-xl border backdrop-blur-md transition-all ${
-            isRfMoving
+            isMotionActive
               ? "bg-rose-950/30 border-rose-500/50 shadow-[0_0_20px_rgba(244,63,94,0.15)]"
               : "bg-slate-900/60 border-slate-800/80"
           }`}
@@ -609,7 +655,7 @@ export default function WifiMotionLab() {
             </span>
             <span
               className={`w-2 h-2 rounded-full ${
-                isRfMoving ? "bg-rose-500 animate-ping" : "bg-cyan-400"
+                isMotionActive ? "bg-rose-500 animate-ping" : "bg-cyan-400"
               }`}
             />
           </div>
@@ -623,13 +669,13 @@ export default function WifiMotionLab() {
             </div>
             <div className="text-right">
               <p className="text-sm font-bold font-mono text-slate-300">
-                {wifiRssi} <span className="text-[10px] font-normal">dBm</span>
+                {wifiRssi.toFixed(1)} <span className="text-[10px] font-normal">dBm</span>
               </p>
               <p className="text-[10px] text-slate-500 font-mono">RSSI to Router</p>
             </div>
           </div>
           <p className="text-[11px] text-slate-400 mt-2 font-mono border-t border-slate-800/60 pt-1.5">
-            {isRfMoving ? `MOTION TRIGGERED (> ${triggerThreshold} dB²)` : `Baseline: ${baselineVariance} dB²`}
+            {isMotionActive ? `MOTION TRIGGERED (> ${triggerThreshold} dB²)` : `Baseline: ${baselineVariance} dB²`}
           </p>
         </div>
 
@@ -663,16 +709,16 @@ export default function WifiMotionLab() {
             </span>
             <span
               className={`px-1.5 py-0.2 rounded text-[10px] font-mono font-bold ${
-                isRfMoving
+                isMotionActive
                   ? "bg-rose-500/20 text-rose-300 border border-rose-500/40"
                   : "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40"
               }`}
             >
-              {isRfMoving ? "TARGET MOVING" : "ROOM QUIET"}
+              {isMotionActive ? "TARGET MOVING" : "ROOM QUIET"}
             </span>
           </div>
           <p className="text-xl md:text-2xl font-bold font-mono text-slate-100">
-            {isRfMoving ? "MOTION" : "STATIONARY"}
+            {isMotionActive ? "MOTION" : "STATIONARY"}
           </p>
           <p className="text-[11px] text-slate-400 mt-2 font-mono border-t border-slate-800/60 pt-1.5">
             Triggers Recorded: <strong className="text-cyan-300">{triggerCount}</strong>
@@ -759,12 +805,14 @@ export default function WifiMotionLab() {
             <UavTacticalRadar
               wifiVariance={wifiVariance}
               csiVariance={csiVariance}
-              isMotionDetected={isRfMoving}
+              isMotionDetected={isMotionActive}
               phoneAccelMag={phoneAccelMag}
               phoneTag={phoneTag}
               isPhoneStreaming={phoneConnected}
               soundEnabled={soundEnabled}
               wifiRssi={wifiRssi}
+              baselineRssi={slowRssi}
+              decorrelationSpread={decorrelationSpread}
             />
           )}
 
@@ -798,13 +846,13 @@ export default function WifiMotionLab() {
             <div className="flex items-center gap-3">
               <span
                 className={`w-3 h-3 rounded-full ${
-                  isRfMoving ? "bg-rose-500 animate-ping" : "bg-emerald-400"
+                  isMotionActive ? "bg-rose-500 animate-ping" : "bg-emerald-400"
                 }`}
               />
               <span className="text-xs font-mono text-slate-300">
                 RADAR STATUS:{" "}
-                <strong className={isRfMoving ? "text-rose-400 font-bold" : "text-emerald-400 font-bold"}>
-                  {isRfMoving ? "MOTION DETECTED" : "ROOM QUIET & CLEAR"}
+                <strong className={isMotionActive ? "text-rose-400 font-bold" : "text-emerald-400 font-bold"}>
+                  {isMotionActive ? "MOTION DETECTED" : "ROOM QUIET & CLEAR"}
                 </strong>
               </span>
               <span className="text-[11px] text-slate-500 font-mono">
@@ -898,12 +946,12 @@ export default function WifiMotionLab() {
                       <Radio className="w-3.5 h-3.5" />
                       1. ESP32 2.4 GHz RF Multipath
                     </span>
-                    <span className={isRfMoving ? "text-rose-400 font-bold" : "text-emerald-400"}>
-                      {isRfMoving ? "TRIPPED" : "STABLE"}
+                    <span className={isMotionActive ? "text-rose-400 font-bold" : "text-emerald-400"}>
+                      {isMotionActive ? "TRIPPED" : "STABLE"}
                     </span>
                   </div>
                   <div className="text-[11px] text-slate-400 font-mono">
-                    Measured Variance: <strong className="text-slate-200">{wifiVariance.toFixed(2)} dB²</strong> &bull; RSSI: {wifiRssi} dBm
+                    Measured Variance: <strong className="text-slate-200">{wifiVariance.toFixed(2)} dB²</strong> &bull; RSSI: {wifiRssi.toFixed(1)} dBm
                   </div>
                 </div>
 
@@ -1014,11 +1062,11 @@ export default function WifiMotionLab() {
                       Subcarrier Phase Decorrelation (σ²Δ)
                     </span>
                     <span className="text-purple-300 font-mono font-bold">
-                      {decorrelationSpread.toFixed(1)}
+                      {decorrelationSpread.toFixed(2)}
                     </span>
                   </div>
                   <div className="text-[10px] text-slate-400 font-mono">
-                    Single body produces coherent fading (&lt; 14). Multiple simultaneous bodies cause frequency-selective phase notches (&gt; 16).
+                    Quiet room (&lt; 0.8). Single body coherent fading (0.8–2.5). Multiple simultaneous bodies (&ge; 2.5).
                   </div>
                 </div>
 
@@ -1028,7 +1076,7 @@ export default function WifiMotionLab() {
                     <span className="text-slate-300 font-bold">
                       Sustained Crowd Persistence (CUSUM)
                     </span>
-                    <span className={leakyBucketLevel > 50 ? "text-rose-400 font-bold" : "text-cyan-300"}>
+                    <span className={leakyBucketLevel >= 60 ? "text-rose-400 font-bold" : "text-cyan-300"}>
                       {Math.round(leakyBucketLevel)}%
                     </span>
                   </div>
