@@ -23,6 +23,7 @@ import {
   Users,
   ShieldAlert,
   Gauge,
+  Sparkles,
 } from "lucide-react";
 import LabSignalChart, { DataPoint } from "@/components/LabSignalChart";
 import CsiSpectrogramCanvas from "@/components/CsiSpectrogramCanvas";
@@ -51,6 +52,11 @@ export default function WifiMotionLab() {
   const [portName, setPortName] = useState<string>("COM3");
   const baudRate = 115200;
   const [serialSupported, setSerialSupported] = useState<boolean>(true);
+
+  // Location Demo Mode (For testing when away from ESP32 hardware)
+  const [isSimulationMode, setIsSimulationMode] = useState<boolean>(true);
+  const [simScenario, setSimScenario] = useState<"auto" | "walk" | "still" | "multi" | "pet" | "empty">("auto");
+
 
   // Phone Ground Truth Telemetry State
   const [phoneConnected, setPhoneConnected] = useState<boolean>(false);
@@ -167,6 +173,7 @@ export default function WifiMotionLab() {
           if (data.connected && data.source !== "stale_cache") {
             failureCount = 0;
             setAutoSyncConnected(true);
+            setIsSimulationMode(false);
             if (data.ip) setEsp32Ip(data.ip);
             if (data.rssi !== undefined && data.rssi !== 0) setWifiRssi(Number(data.rssi));
             if (data.slowRssi !== undefined && data.slowRssi !== 0) setSlowRssi(Number(data.slowRssi));
@@ -198,6 +205,101 @@ export default function WifiMotionLab() {
 
     return () => clearInterval(pollInterval);
   }, [isSerialConnected]);
+
+  // 1b. Simulation Telemetry Engine (Runs when isSimulationMode is active and no real ESP32 is pushing data)
+  useEffect(() => {
+    if (!isSimulationMode || autoSyncConnected || isSerialConnected) return;
+
+    let tick = 0;
+    const simInterval = setInterval(() => {
+      tick++;
+
+      let active = simScenario;
+      if (simScenario === "auto") {
+        const cycleSec = Math.floor(tick / 10) % 70;
+        if (cycleSec < 14) active = "walk";
+        else if (cycleSec < 28) active = "still";
+        else if (cycleSec < 42) active = "multi";
+        else if (cycleSec < 56) active = "pet";
+        else active = "empty";
+      }
+
+      const phoneOverriding = phoneConnected && (phoneAccelMag > 1.2 || phoneGyroMag > 0.4);
+
+      let targetRssi = -58.0;
+      let targetVar = 0.12;
+      let targetCsi = 0.22;
+      let targetDecorr = 0.4;
+      let moving = false;
+
+      if (phoneOverriding) {
+        moving = true;
+        targetVar = Math.min(4.5, 0.8 + phoneAccelMag * 0.4 + phoneGyroMag * 0.2);
+        targetCsi = Math.min(3.8, 0.9 + phoneAccelMag * 0.35);
+        targetDecorr = 1.2 + (phoneGyroMag > 1.0 ? 1.0 : 0.0);
+        targetRssi = -55.0 - Math.sin(tick * 0.2) * 5.0;
+      } else if (active === "walk") {
+        moving = true;
+        targetVar = 1.2 + Math.sin(tick * 0.4) * 0.6 + (Math.random() - 0.5) * 0.3;
+        targetCsi = 1.4 + Math.cos(tick * 0.35) * 0.5;
+        targetDecorr = 1.1 + Math.sin(tick * 0.2) * 0.3;
+        targetRssi = -54.0 - Math.sin(tick * 0.1) * 6.0;
+      } else if (active === "still") {
+        moving = false;
+        targetVar = 0.14 + (Math.random() - 0.5) * 0.04;
+        targetCsi = 0.32 + Math.sin(tick * 0.16) * 0.08;
+        targetDecorr = 0.45;
+        targetRssi = -57.5;
+      } else if (active === "multi") {
+        moving = true;
+        targetVar = 2.4 + Math.sin(tick * 0.5) * 0.8;
+        targetCsi = 2.5 + Math.cos(tick * 0.4) * 0.7;
+        targetDecorr = 2.8 + Math.sin(tick * 0.3) * 0.5;
+        targetRssi = -52.0 - Math.sin(tick * 0.15) * 8.0;
+      } else if (active === "pet") {
+        moving = true;
+        targetVar = 0.48 + Math.sin(tick * 0.6) * 0.15;
+        targetCsi = 1.1 + (Math.random() - 0.5) * 0.3;
+        targetDecorr = 0.9;
+        targetRssi = -58.0;
+      } else {
+        moving = false;
+        targetVar = 0.10 + (Math.random() - 0.5) * 0.03;
+        targetCsi = 0.18;
+        targetDecorr = 0.35;
+        targetRssi = -60.0;
+      }
+
+      setWifiRssi((prev) => parseFloat((0.85 * prev + 0.15 * targetRssi).toFixed(1)));
+      setSlowRssi((prev) => parseFloat((0.98 * prev + 0.02 * targetRssi).toFixed(1)));
+      setWifiVariance(parseFloat(Math.max(0.06, targetVar).toFixed(2)));
+      setCsiVariance(parseFloat(Math.max(0.12, targetCsi).toFixed(2)));
+      setHwDecorrelation(parseFloat(Math.max(0.2, targetDecorr).toFixed(2)));
+      setIsRfMoving(moving);
+
+      const subs = new Array(64).fill(16);
+      const respFreq = 0.16;
+      const respWave = Math.sin(tick * respFreq) * 1.8;
+      for (let i = 0; i < 64; i++) {
+        if (i < 6 || i > 58 || i === 32) {
+          subs[i] = 0;
+        } else {
+          const baseShape = 14 + Math.sin(i * 0.28) * 6;
+          const motionRipple = moving ? Math.sin((i + tick) * 0.4) * (targetVar * 1.8) : 0;
+          const stillRipple = (active === "still" && i >= 18 && i <= 36) ? respWave : 0;
+          subs[i] = Math.max(2, Math.round(baseShape + motionRipple + stillRipple));
+        }
+      }
+      setSubcarrierAmplitudes(subs);
+
+      if (moving && tick % 25 === 0) {
+        setTriggerCount((prev) => prev + 1);
+      }
+    }, 100);
+
+    return () => clearInterval(simInterval);
+  }, [isSimulationMode, autoSyncConnected, isSerialConnected, simScenario, phoneConnected, phoneAccelMag, phoneGyroMag]);
+
 
   // 2. Poll Phone Ground Truth Telemetry (/api/phone-telemetry)
   useEffect(() => {
@@ -241,7 +343,7 @@ export default function WifiMotionLab() {
       const thresholdExceeded =
         wifiVariance >= triggerThreshold || csiVariance >= Math.max(1.1, triggerThreshold * 1.4);
       const rfTripped =
-        (autoSyncConnected || isSerialConnected) && (isRfMoving || thresholdExceeded);
+        (autoSyncConnected || isSerialConnected || isSimulationMode) && (isRfMoving || thresholdExceeded);
 
       if (rfTripped) {
         if (now - lastEventTimeRef.current > 3000) {
@@ -455,14 +557,14 @@ export default function WifiMotionLab() {
 
   // Unified Motion Decision across all views
   const isMotionActive =
-    (autoSyncConnected || isSerialConnected) &&
+    (autoSyncConnected || isSerialConnected || isSimulationMode) &&
     (isRfMoving ||
       wifiVariance >= triggerThreshold ||
       csiVariance >= Math.max(1.1, triggerThreshold * 1.4));
 
   // Real-Time Multi-Sensor Fusion Engine
   // 1. Wi-Fi RF component (from ESP32)
-  const rfConfidence = (autoSyncConnected || isSerialConnected)
+  const rfConfidence = (autoSyncConnected || isSerialConnected || isSimulationMode)
     ? Math.min(100, Math.round((wifiVariance / Math.max(0.25, triggerThreshold)) * 75))
     : 0;
   // 2. Phone inertial component (from Gyroscope + Accelerometer with explicit permission)
@@ -511,7 +613,7 @@ export default function WifiMotionLab() {
         routerDistMeters,
         routerBearingDeg,
         selectedRadiusMeters,
-        connected: autoSyncConnected || isSerialConnected,
+        connected: autoSyncConnected || isSerialConnected || isSimulationMode,
       });
       setRfDecomp(result);
     }, 100);
@@ -556,7 +658,7 @@ export default function WifiMotionLab() {
   useEffect(() => {
     const bucketInterval = setInterval(() => {
       setLeakyBucketLevel((prev) => {
-        if (!autoSyncConnected && !isSerialConnected) {
+        if (!autoSyncConnected && !isSerialConnected && !isSimulationMode) {
           return Math.max(0, prev - 3.0);
         }
         const activeBaseline = Math.max(0.12, noiseFloor || baselineVariance);
@@ -682,16 +784,53 @@ export default function WifiMotionLab() {
         </div>
       </header>
 
+      {/* Location Demo Mode Scenario Selector (When no ESP32 is connected) */}
+      {isSimulationMode && !autoSyncConnected && !isSerialConnected && (
+        <div className="mt-3 flex flex-wrap items-center justify-between gap-2 p-2.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-xs font-mono">
+          <div className="flex items-center gap-2 text-amber-300">
+            <Sparkles className="w-4 h-4 text-amber-400 shrink-0" />
+            <span className="font-bold uppercase">Location Demo Active:</span>
+            <span className="text-slate-300">Simulating 2.4 GHz multipath radar telemetry (Grandpa's Place &bull; No ESP32 needed).</span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <span className="text-slate-400 text-[11px] mr-1">Scenario:</span>
+            {(
+              [
+                { id: "auto", label: "Auto Cycle" },
+                { id: "walk", label: "🚶 Person Walk" },
+                { id: "still", label: "🧘 Still Lock" },
+                { id: "multi", label: "👥 2 People" },
+                { id: "pet", label: "🐾 Pet" },
+                { id: "empty", label: "🤫 Clear" },
+              ] as const
+            ).map((s) => (
+              <button
+                key={s.id}
+                onClick={() => setSimScenario(s.id)}
+                className={`px-2 py-1 rounded text-[11px] font-bold transition-all cursor-pointer ${
+                  simScenario === s.id
+                    ? "bg-amber-400 text-slate-950 shadow-sm"
+                    : "bg-slate-900 text-slate-300 hover:bg-slate-800 border border-slate-700"
+                }`}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+
       {dashboardMode === "simple" ? (
         <main className="my-6 flex-1 flex flex-col justify-center">
           <SimpleMotionView
-            connected={autoSyncConnected || isSerialConnected}
+            connected={autoSyncConnected || isSerialConnected || isSimulationMode}
             isMoving={isMotionActive}
             rssi={Number(wifiRssi.toFixed(1))}
             variance={wifiVariance}
             csiVariance={csiVariance}
             triggerCount={triggerCount}
-            ip={esp32Ip}
+            ip={isSimulationMode && !autoSyncConnected && !isSerialConnected ? "DEMO (NO ESP32)" : esp32Ip}
             onCalibrate={handleCalibrateBaseline}
             isCalibrating={isCalibrating}
             calibrationProgress={calibrationProgress}
